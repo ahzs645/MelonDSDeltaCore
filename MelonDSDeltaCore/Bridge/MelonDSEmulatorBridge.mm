@@ -30,6 +30,11 @@
 #include "melonDS/src/frontend/qt_sdl/LAN_Socket.h"
 
 #include <memory>
+#include <vector>
+#include <deque>
+#include <mutex>
+#include <cstdarg>
+#include <unistd.h>
 
 #import <notify.h>
 #import <pthread.h>
@@ -134,6 +139,57 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 
 @end
 
+namespace
+{
+    NSNotificationName const MelonDSDidProduceMultiplayerPacketNotification = @"MelonDSDidProduceMultiplayerPacketNotification";
+
+    struct MultiplayerPacket
+    {
+        MelonDSMultiplayerPacketType type;
+        uint64_t timestamp;
+        std::vector<u8> payload;
+    };
+
+    std::mutex sMultiplayerQueueLock;
+    std::deque<MultiplayerPacket> sRegularPackets;
+    std::deque<MultiplayerPacket> sHostPackets;
+    std::deque<MultiplayerPacket> sReplyPackets;
+    std::deque<MultiplayerPacket> sAckPackets;
+
+    std::deque<MultiplayerPacket> &QueueForType(MelonDSMultiplayerPacketType type)
+    {
+        switch (type)
+        {
+            case MelonDSMultiplayerPacketTypeCommand: return sHostPackets;
+            case MelonDSMultiplayerPacketTypeReply: return sReplyPackets;
+            case MelonDSMultiplayerPacketTypeAck: return sAckPackets;
+            case MelonDSMultiplayerPacketTypeRegular:
+            default:
+                return sRegularPackets;
+        }
+    }
+
+    int DequeuePacket(std::deque<MultiplayerPacket> &queue, u8 *data, u64 *timestamp)
+    {
+        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+        if (queue.empty())
+        {
+            return 0;
+        }
+
+        MultiplayerPacket packet = std::move(queue.front());
+        queue.pop_front();
+
+        if (timestamp != nullptr)
+        {
+            *timestamp = packet.timestamp;
+        }
+
+        memcpy(data, packet.payload.data(), packet.payload.size());
+        return (int)packet.payload.size();
+    }
+}
+
 @implementation MelonDSEmulatorBridge
 @synthesize audioRenderer = _audioRenderer;
 @synthesize videoRenderer = _videoRenderer;
@@ -147,8 +203,30 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     dispatch_once(&onceToken, ^{
         _emulatorBridge = [[self alloc] init];
     });
-    
+
     return _emulatorBridge;
+}
+
++ (NSNotificationName)didProduceMultiplayerPacketNotification
+{
+    return MelonDSDidProduceMultiplayerPacketNotification;
+}
+
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp
+{
+    if (packet.length == 0)
+    {
+        return;
+    }
+
+    MultiplayerPacket incomingPacket;
+    incomingPacket.type = type;
+    incomingPacket.timestamp = timestamp;
+    incomingPacket.payload.resize(packet.length);
+    memcpy(incomingPacket.payload.data(), packet.bytes, packet.length);
+
+    std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+    QueueForType(type).push_back(std::move(incomingPacket));
 }
 
 - (instancetype)init
@@ -158,17 +236,17 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         _cheatCodes = std::make_shared<ARCodeFile>("");
         _activatedInputs = 0;
-        
+
         _audioEQEffect = [[AVAudioUnitEQ alloc] initWithNumberOfBands:2];
-        
+
         _microphoneBuffer = [[DLTARingBuffer alloc] initWithPreferredBufferSize:100 * 1024];
         _microphoneQueue = dispatch_queue_create("com.rileytestut.MelonDSDeltaCore.Microphone", DISPATCH_QUEUE_SERIAL);
-        
+
         _closedLidFrameCount = 0;
-        
+
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAudioSessionInterruption:) name:AVAudioSessionInterruptionNotification object:nil];
     }
-    
+
     return self;
 }
 
@@ -192,10 +270,10 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         SPI_Firmware::DNS = { 0, 0, 0, 0 };
     }
-    
+
     int64_t wfcID = [[[NSUserDefaults standardUserDefaults] objectForKey:MelonDSWFCIDUserDefaultsKey] longLongValue];
     int64_t wfcFlags = [[[NSUserDefaults standardUserDefaults] objectForKey:MelonDSWFCFlagsUserDefaultsKey] longLongValue];
-    
+
     if (wfcID != 0)
     {
         SPI_Firmware::wfcID = wfcID;
@@ -206,9 +284,9 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         SPI_Firmware::wfcID = 0;
         SPI_Firmware::wfcFlags = 0;
     }
-    
+
     self.gameURL = gameURL;
-    
+
     if ([self isInitialized])
     {
         NDS::DeInit();
@@ -216,36 +294,36 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     else
     {
         Config::Load();
-        
+
         Config::FirmwareUsername = "Delta";
         Config::FirmwareBirthdayDay = 7;
         Config::FirmwareBirthdayMonth = 10;
-        
+
         // DS paths
         Config::BIOS7Path = self.bios7URL.lastPathComponent.UTF8String;
         Config::BIOS9Path = self.bios9URL.lastPathComponent.UTF8String;
         Config::FirmwarePath = self.firmwareURL.lastPathComponent.UTF8String;
-        
+
         // DSi paths
         Config::DSiBIOS7Path = self.dsiBIOS7URL.lastPathComponent.UTF8String;
         Config::DSiBIOS9Path = self.dsiBIOS9URL.lastPathComponent.UTF8String;
         Config::DSiFirmwarePath = self.dsiFirmwareURL.lastPathComponent.UTF8String;
         Config::DSiNANDPath = self.dsiNANDURL.lastPathComponent.UTF8String;
-        
+
         [self registerForNotifications];
-        
+
         // Renderer is not deinitialized in NDS::DeInit, so initialize it only once.
         GPU::InitRenderer(0);
     }
-    
+
     [self prepareAudioEngine];
-    
+
     NDS::SetConsoleType((int)self.systemType);
-    
+
     // AltJIT does not yet support melonDS 0.9.5.
     // Config::JIT_Enable = [self isJITEnabled];
     // Config::JIT_FastMemory = NO;
-    
+
     if ([[NSFileManager defaultManager] fileExistsAtPath:self.bios7URL.path] &&
         [[NSFileManager defaultManager] fileExistsAtPath:self.bios9URL.path] &&
         [[NSFileManager defaultManager] fileExistsAtPath:self.firmwareURL.path])
@@ -258,23 +336,23 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         // External BIOS files don't exist, so fall back to internal BIOS.
         Config::ExternalBIOSEnable = false;
     }
-    
+
     NDS::Init();
     self.initialized = YES;
-        
+
     GPU::RenderSettings settings;
     settings.Soft_Threaded = YES;
 
     GPU::SetRenderSettings(0, settings);
-    
+
     NDS::Reset();
     self.gbaSaveURL = nil;
-    
+
     BOOL isDirectory = NO;
     if ([[NSFileManager defaultManager] fileExistsAtPath:gameURL.path isDirectory:&isDirectory] && !isDirectory)
     {
         // Game exists and is not a directory.
-        
+
         NSError *error = nil;
         NSData *romData = [NSData dataWithContentsOfURL:gameURL options:0 error:&error];
         if (romData == nil)
@@ -282,7 +360,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
             NSLog(@"Failed to load Nintendo DS ROM. %@", error);
             return;
         }
-        
+
         if (NDS::LoadCart((const u8 *)romData.bytes, (u32)romData.length, NULL, 0))
         {
             NDS::SetupDirectBoot(gameURL.lastPathComponent.UTF8String);
@@ -291,21 +369,21 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         {
             NSLog(@"Failed to load Nintendo DS ROM.");
         }
-        
+
         if (self.gbaGameURL != nil)
         {
             NSData *gbaROMData = [NSData dataWithContentsOfURL:self.gbaGameURL options:0 error:&error];
             if (gbaROMData)
             {
                 NSURL *gbaSaveURL = [[self.gbaGameURL URLByDeletingPathExtension] URLByAppendingPathExtension:@"sav"];
-                
+
                 NSData *saveData = [NSData dataWithContentsOfURL:gbaSaveURL options:0 error:&error];
                 if (saveData == nil && !([error.domain isEqualToString:NSCocoaErrorDomain] && error.code == NSFileReadNoSuchFileError))
                 {
                     // Ignore "file not found" errors.
                     NSLog(@"Failed to load inserted GBA ROM save data. %@", error);
                 }
-                
+
                 if (NDS::LoadGBACart((const u8 *)gbaROMData.bytes, (u32)gbaROMData.length, (const u8 *)saveData.bytes, (u32)saveData.length))
                 {
                     // Cache save URL so we don't accidentally overwrite save data for the wrong game when switching.
@@ -326,20 +404,20 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         NDS::LoadBIOS();
     }
-    
+
     self.stopping = NO;
-    
+
     NDS::Start();
 }
 
 - (void)stop
 {
     self.stopping = YES;
-    
+
     NDS::Stop();
-    
+
     [self.audioEngine stop];
-    
+
     // Assign to nil to prevent microphone indicator
     // staying on after returning from background.
     self.audioEngine = nil;
@@ -362,15 +440,15 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         return;
     }
-    
+
     int previousClientStatus = WifiAP::ClientStatus;
-    
+
     uint32_t inputs = self.activatedInputs;
     uint32_t inputsMask = 0xFFF; // 0b000000111111111111;
-    
+
     uint16_t sanitizedInputs = inputsMask ^ inputs;
     NDS::SetKeyMask(sanitizedInputs);
-    
+
     if (self.activatedInputs & MelonDSGameInputTouchScreenX || self.activatedInputs & MelonDSGameInputTouchScreenY)
     {
         NDS::TouchScreen(self.touchScreenPoint.x, self.touchScreenPoint.y);
@@ -379,7 +457,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         NDS::ReleaseScreen();
     }
-    
+
     if (self.activatedInputs & MelonDSGameInputLid)
     {
         NDS::SetLidClosed(true);
@@ -397,44 +475,44 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
             self.closedLidFrameCount += 1;
         }
     }
-    
+
     static int16_t micBuffer[735];
     NSInteger readBytes = (NSInteger)[self.microphoneBuffer readIntoBuffer:micBuffer preferredSize:735 * sizeof(int16_t)];
     NSInteger readFrames = readBytes / sizeof(int16_t);
-    
+
     if (readFrames > 0)
     {
         NDS::MicInputFrame(micBuffer, (int)readFrames);
     }
-    
+
     if ([self isJITEnabled])
     {
         // Skipping frames with JIT disabled can cause graphical bugs,
         // so limit frame skip to devices that support JIT (for now).
-        
+
         // JIT not currently supported with melonDS 0.9.5.
         // NDS::SetSkipFrame(!processVideo);
     }
-    
+
     NDS::RunFrame();
-    
+
     static int16_t buffer[0x1000];
     u32 availableBytes = SPU::GetOutputSize();
     availableBytes = MAX(availableBytes, (u32)(sizeof(buffer) / (2 * sizeof(int16_t))));
-       
+
     int samples = SPU::ReadOutput(buffer, availableBytes);
     [self.audioRenderer.audioBuffer writeBuffer:buffer size:samples * 4];
-    
+
     if (processVideo)
     {
         int screenBufferSize = 256 * 192 * 4;
-        
+
         memcpy(self.videoRenderer.videoBuffer, GPU::Framebuffer[GPU::FrontBuffer][0], screenBufferSize);
         memcpy(self.videoRenderer.videoBuffer + screenBufferSize, GPU::Framebuffer[GPU::FrontBuffer][1], screenBufferSize);
-        
+
         [self.videoRenderer processFrame];
     }
-    
+
     if (WifiAP::ClientStatus != previousClientStatus)
     {
         if (WifiAP::ClientStatus == 0)
@@ -456,13 +534,13 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         return nil;
     }
-    
+
     if (address + size > 0x1000000)
     {
         // Beyond RAM bounds, return nil.
         return nil;
     }
-    
+
     void *bytes = (NDS::MainRAM + address);
     NSData *data = [NSData dataWithBytesNoCopy:bytes length:size freeWhenDone:NO];
     return data;
@@ -473,19 +551,19 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 - (void)activateInput:(NSInteger)input value:(double)value playerIndex:(NSInteger)playerIndex
 {
     self.activatedInputs |= (uint32_t)input;
-    
+
     CGPoint touchPoint = self.touchScreenPoint;
-    
+
     switch ((MelonDSGameInput)input)
     {
     case MelonDSGameInputTouchScreenX:
         touchPoint.x = value * (256 - 1);
         break;
-        
+
     case MelonDSGameInputTouchScreenY:
         touchPoint.y = value * (192 - 1);
         break;
-            
+
     default: break;
     }
 
@@ -495,22 +573,22 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 - (void)deactivateInput:(NSInteger)input playerIndex:(NSInteger)playerIndex
 {
     self.activatedInputs &= ~((uint32_t)input);
-    
+
     CGPoint touchPoint = self.touchScreenPoint;
-    
+
     switch ((MelonDSGameInput)input)
     {
         case MelonDSGameInputTouchScreenX:
             touchPoint.x = 0;
             break;
-            
+
         case MelonDSGameInputTouchScreenY:
             touchPoint.y = 0;
             break;
-            
+
         default: break;
     }
-    
+
     self.touchScreenPoint = touchPoint;
 }
 
@@ -532,7 +610,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
             NSLog(@"Failed write save data. %@", error);
         }
     }
-    
+
     if (self.gbaSaveURL != nil && self.gbaSaveData.length > 0)
     {
         NSError *error = nil;
@@ -541,20 +619,20 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
             NSLog(@"Failed write GBA save data. %@", error);
         }
     }
-    
+
     if (SPI_Firmware::Firmware)
     {
         // Save WFC ID to NSUserDefaults
-        
+
         u32 userdata = 0x7FE00 & SPI_Firmware::FirmwareMask;
         u32 apdata = userdata - 0x400;
-        
+
         int64_t wfcID = 0;
         int64_t wfcFlags = 0;
-        
+
         memcpy(&wfcID, &SPI_Firmware::Firmware[apdata + 0xF0], 6);
         memcpy(&wfcFlags, &SPI_Firmware::Firmware[apdata + 0xF6], 8);
-        
+
         if (wfcID != 0)
         {
             [[NSUserDefaults standardUserDefaults] setObject:@(wfcID) forKey:MelonDSWFCIDUserDefaultsKey];
@@ -574,7 +652,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         return;
     }
-    
+
     NSError *error = nil;
     NSData *saveData = [NSData dataWithContentsOfURL:fileURL options:0 error:&error];
     if (saveData == nil)
@@ -582,7 +660,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         NSLog(@"Failed load save data. %@", error);
         return;
     }
-    
+
     NDS::LoadSave((const u8 *)saveData.bytes, (u32)saveData.length);
 }
 
@@ -613,19 +691,19 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         {
             return NO;
         }
-        
+
         NSMutableCharacterSet *legalCharactersSet = [NSMutableCharacterSet hexadecimalCharacterSet];
         [legalCharactersSet addCharactersInString:@" "];
-        
+
         if ([code rangeOfCharacterFromSet:legalCharactersSet.invertedSet].location != NSNotFound)
         {
             return NO;
         }
     }
-    
+
     NSString *sanitizedCode = [[cheatCode componentsSeparatedByCharactersInSet:NSCharacterSet.hexadecimalCharacterSet.invertedSet] componentsJoinedByString:@""];
     u32 codeLength = (u32)(sanitizedCode.length / 8);
-    
+
     ARCode code;
     code.Name = sanitizedCode.UTF8String;
     ParseTextCode((char *)sanitizedCode.UTF8String, (int)[sanitizedCode lengthOfBytesUsingEncoding:NSUTF8StringEncoding], &code.Code[0], 128);
@@ -657,12 +735,12 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 - (void)registerForNotifications
 {
     NSString *privateAPIName = [[@[@"com", @"apple", @"springboard", @"hasBlank3dScr33n"] componentsJoinedByString:@"."] stringByReplacingOccurrencesOfString:@"3" withString:@"e"];
-    
+
     int status = notify_register_dispatch(privateAPIName.UTF8String, &_notifyToken, dispatch_get_main_queue(), ^(int t) {
         uint64_t state;
         int result = notify_get_state(self.notifyToken, &state);
         NSLog(@"Lock screen state = %llu", state);
-        
+
         if (state == 0)
         {
             [self deactivateInput:MelonDSGameInputLid playerIndex:0];
@@ -671,13 +749,13 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         {
             [self activateInput:MelonDSGameInputLid value:1 playerIndex:0];
         }
-        
+
         if (result != NOTIFY_STATUS_OK)
         {
             NSLog(@"Lock screen notification returned: %d", result);
         }
     });
-    
+
     if (status != NOTIFY_STATUS_OK)
     {
         NSLog(@"Lock screen notification registration returned: %d", status);
@@ -695,9 +773,9 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         self.microphoneEnabled = NO;
         return;
     }
-    
+
     self.microphoneEnabled = YES;
-        
+
     // Experimentally-determined values. Focuses on ensuring blows are registered correctly.
     self.audioEQEffect.bands[0].filterType = AVAudioUnitEQFilterTypeLowShelf;
     self.audioEQEffect.bands[0].frequency = 100;
@@ -708,12 +786,12 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     self.audioEQEffect.bands[1].frequency = 10000;
     self.audioEQEffect.bands[1].gain = -30;
     self.audioEQEffect.bands[1].bypass = NO;
-    
+
     self.audioEQEffect.globalGain = 3;
-    
+
     [self.audioEngine attachNode:self.audioEQEffect];
     [self.audioEngine connect:self.audioEngine.inputNode to:self.audioEQEffect format:self.audioConverter.inputFormat];
-    
+
     unsigned int bufferSize = 1024 * self.audioConverter.inputFormat.streamDescription->mBytesPerFrame;
     [self.audioEQEffect installTapOnBus:0 bufferSize:bufferSize format:self.audioConverter.inputFormat block:^(AVAudioPCMBuffer * _Nonnull buffer, AVAudioTime * _Nonnull when) {
         dispatch_async(self.microphoneQueue, ^{
@@ -726,9 +804,9 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 {
     static AVAudioPCMBuffer *outputBuffer = [[AVAudioPCMBuffer alloc] initWithPCMFormat:self.audioConverter.outputFormat frameCapacity:5000];
     outputBuffer.frameLength = 5000;
-    
+
     __block BOOL didReturnBuffer = NO;
-    
+
     NSError *error = nil;
     AVAudioConverterOutputStatus status = [self.audioConverter convertToBuffer:outputBuffer error:&error
                                                             withInputFromBlock:^AVAudioBuffer * _Nullable(AVAudioPacketCount packetCount, AVAudioConverterInputStatus * _Nonnull outStatus) {
@@ -749,7 +827,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
     {
         NSLog(@"Conversion error: %@", error);
     }
-    
+
     NSInteger outputSize = outputBuffer.frameLength * outputBuffer.format.streamDescription->mBytesPerFrame;
     [self.microphoneBuffer writeBuffer:outputBuffer.int16ChannelData[0] size:outputSize];
 }
@@ -757,7 +835,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 - (void)handleAudioSessionInterruption:(NSNotification *)notification
 {
     AVAudioSessionInterruptionType interruptionType = (AVAudioSessionInterruptionType)[notification.userInfo[AVAudioSessionInterruptionTypeKey] integerValue];
-    
+
     switch (interruptionType)
     {
         case AVAudioSessionInterruptionTypeBegan:
@@ -765,7 +843,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
             self.microphoneEnabled = NO;
             break;
         }
-            
+
         case AVAudioSessionInterruptionTypeEnded:
         {
             if (self.audioEngine)
@@ -773,7 +851,7 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
                 // Only reset audio engine if there is currently an active one.
                 [self prepareAudioEngine];
             }
-            
+
             break;
         }
     }
@@ -830,197 +908,73 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
         AVAudioFormat *outputFormat = [[AVAudioFormat alloc] initWithCommonFormat:AVAudioPCMFormatInt16 sampleRate:44100 channels:1 interleaved:NO];
         _audioConverter = [[AVAudioConverter alloc] initFromFormat:inputFormat toFormat:outputFormat];
     }
-    
+
     return _audioConverter;
 }
 
 @end
 
-namespace Platform
+namespace melonDS::Platform
 {
-    int IPCInstanceID;
-
-    void StopEmu()
+    namespace
     {
+        const char *FileModeToString(FileMode mode)
+        {
+            auto hasFlag = [&](FileMode flag) {
+            return (static_cast<unsigned>(mode) & static_cast<unsigned>(flag)) != 0;
+        };
+        const bool read = hasFlag(FileMode::Read);
+        const bool write = hasFlag(FileMode::Write);
+        const bool append = hasFlag(FileMode::Append);
+        const bool preserve = hasFlag(FileMode::Preserve);
+        const bool text = hasFlag(FileMode::Text);
+
+            if (append) return text ? "ab+" : "ab+";
+            if (read && write) return (preserve || hasFlag(FileMode::NoCreate)) ? (text ? "r+" : "rb+") : (text ? "w+" : "wb+");
+            if (write) return preserve ? (text ? "a" : "ab") : (text ? "w" : "wb");
+            return text ? "r" : "rb";
+        }
+
+        FILE* AsFILE(FileHandle* file)
+        {
+            return reinterpret_cast<FILE*>(file);
+        }
+
+        FileHandle* AsFileHandle(FILE* file)
+        {
+            return reinterpret_cast<FileHandle*>(file);
+        }
+    }
+
+    void SignalStop(StopReason reason, void* userdata)
+    {
+        (void)reason;
+        (void)userdata;
         if ([MelonDSEmulatorBridge.sharedBridge isStopping])
         {
             return;
         }
-        
+
         MelonDSEmulatorBridge.sharedBridge.stopping = YES;
         [[NSNotificationCenter defaultCenter] postNotificationName:DLTAEmulatorCore.emulationDidQuitNotification object:MelonDSEmulatorBridge.sharedBridge];
     }
 
-    int InstanceID()
+    std::string GetLocalFilePath(const std::string& filename)
     {
-        return IPCInstanceID;
+        NSURL *url = [MelonDSEmulatorBridge.coreDirectoryURL URLByAppendingPathComponent:@(filename.c_str())];
+        return std::string(url.fileSystemRepresentation);
     }
 
-    std::string InstanceFileSuffix()
+    FileHandle* OpenFile(const std::string& path, FileMode mode)
     {
-        int inst = IPCInstanceID;
-        if (inst == 0) return "";
-
-        char suffix[16] = {0};
-        snprintf(suffix, 15, ".%d", inst+1);
-        return suffix;
+        const char *modeString = FileModeToString(mode);
+        FILE *file = fopen(path.c_str(), modeString);
+        return AsFileHandle(file);
     }
 
-    int GetConfigInt(ConfigEntry entry)
-    {
-        const int imgsizes[] = {0, 256, 512, 1024, 2048, 4096};
-
-        switch (entry)
-        {
-    #ifdef JIT_ENABLED
-        case JIT_MaxBlockSize: return Config::JIT_MaxBlockSize;
-    #endif
-
-        case DLDI_ImageSize: return imgsizes[Config::DLDISize];
-
-        case DSiSD_ImageSize: return imgsizes[Config::DSiSDSize];
-
-        case Firm_Language: return Config::FirmwareLanguage;
-        case Firm_BirthdayMonth: return Config::FirmwareBirthdayMonth;
-        case Firm_BirthdayDay: return Config::FirmwareBirthdayDay;
-        case Firm_Color: return Config::FirmwareFavouriteColour;
-
-        case AudioBitrate: return Config::AudioBitrate;
-                
-        default: return 0;
-        }
-    }
-
-    bool GetConfigBool(ConfigEntry entry)
-    {
-        switch (entry)
-        {
-    #ifdef JIT_ENABLED
-        case JIT_Enable: return Config::JIT_Enable != 0;
-        case JIT_LiteralOptimizations: return Config::JIT_LiteralOptimisations != 0;
-        case JIT_BranchOptimizations: return Config::JIT_BranchOptimisations != 0;
-        case JIT_FastMemory: return Config::JIT_FastMemory != 0;
-    #endif
-
-        case ExternalBIOSEnable: return Config::ExternalBIOSEnable != 0;
-
-        case DLDI_Enable: return Config::DLDIEnable != 0;
-        case DLDI_ReadOnly: return Config::DLDIReadOnly != 0;
-        case DLDI_FolderSync: return Config::DLDIFolderSync != 0;
-
-        case DSiSD_Enable: return Config::DSiSDEnable != 0;
-        case DSiSD_ReadOnly: return Config::DSiSDReadOnly != 0;
-        case DSiSD_FolderSync: return Config::DSiSDFolderSync != 0;
-
-        case Firm_OverrideSettings: return Config::FirmwareOverrideSettings != 0;
-                
-        default: return false;
-        }
-    }
-
-    std::string GetConfigString(ConfigEntry entry)
-    {
-        switch (entry)
-        {
-        case BIOS9Path: return Config::BIOS9Path;
-        case BIOS7Path: return Config::BIOS7Path;
-        case FirmwarePath: return Config::FirmwarePath;
-
-        case DSi_BIOS9Path: return Config::DSiBIOS9Path;
-        case DSi_BIOS7Path: return Config::DSiBIOS7Path;
-        case DSi_FirmwarePath: return Config::DSiFirmwarePath;
-        case DSi_NANDPath: return Config::DSiNANDPath;
-
-        case DLDI_ImagePath: return Config::DLDISDPath;
-        case DLDI_FolderPath: return Config::DLDIFolderPath;
-
-        case DSiSD_ImagePath: return Config::DSiSDPath;
-        case DSiSD_FolderPath: return Config::DSiSDFolderPath;
-
-        case Firm_Username: return Config::FirmwareUsername;
-        case Firm_Message: return Config::FirmwareMessage;
-            
-        case ExternalBIOSEnable: break;
-            
-        case DLDI_Enable: break;
-        case DLDI_ImageSize: break;
-        case DLDI_ReadOnly: break;
-        case DLDI_FolderSync: break;
-            
-        case DSiSD_Enable: break;
-        case DSiSD_ImageSize: break;
-        case DSiSD_ReadOnly: break;
-        case DSiSD_FolderSync: break;
-            
-        case Firm_OverrideSettings: break;
-        case Firm_Language: break;
-        case Firm_BirthdayMonth: break;
-        case Firm_BirthdayDay: break;
-        case Firm_Color: break;
-        case Firm_MAC: break;
-        case AudioBitrate: break;
-        }
-
-        return "";
-    }
-
-    bool GetConfigArray(ConfigEntry entry, void* data)
-    {
-        switch (entry)
-        {
-            case Firm_MAC:
-            {
-                std::string& mac_in = Config::FirmwareMAC;
-                u8* mac_out = (u8*)data;
-                
-                int o = 0;
-                u8 tmp = 0;
-                for (int i = 0; i < 18; i++)
-                {
-                    char c = mac_in[i];
-                    if (c == '\0') break;
-                    
-                    int n;
-                    if      (c >= '0' && c <= '9') n = c - '0';
-                    else if (c >= 'a' && c <= 'f') n = c - 'a' + 10;
-                    else if (c >= 'A' && c <= 'F') n = c - 'A' + 10;
-                    else continue;
-                    
-                    if (!(o & 1))
-                        tmp = n;
-                    else
-                        mac_out[o >> 1] = n | (tmp << 4);
-                    
-                    o++;
-                    if (o >= 12) return true;
-                }
-            }
-            
-            default: break;
-        }
-        
-        return false;
-    }
-    
-    FILE* OpenFile(std::string path, std::string mode, bool mustexist)
-    {
-        FILE* ret;
-        
-        if (mustexist)
-        {
-            ret = fopen(path.c_str(), "rb");
-            if (ret) ret = freopen(path.c_str(), mode.c_str(), ret);
-        }
-        else
-            ret = fopen(path.c_str(), mode.c_str());
-        
-        return ret;
-    }
-    
-    FILE* OpenLocalFile(std::string path, std::string mode)
+    FileHandle* OpenLocalFile(const std::string& path, FileMode mode)
     {
         NSURL *relativeURL = [MelonDSEmulatorBridge.coreDirectoryURL URLByAppendingPathComponent:@(path.c_str())];
-        
         NSURL *fileURL = nil;
         if ([[NSFileManager defaultManager] fileExistsAtPath:relativeURL.path] || path.find(".bak") != std::string::npos)
         {
@@ -1030,78 +984,185 @@ namespace Platform
         {
             fileURL = [NSURL fileURLWithPath:@(path.c_str())];
         }
-        
-        return OpenFile(fileURL.fileSystemRepresentation, mode.c_str());
+
+        return OpenFile(std::string(fileURL.fileSystemRepresentation), mode);
     }
-    
+
+    bool FileExists(const std::string& name)
+    {
+        return [[NSFileManager defaultManager] fileExistsAtPath:@(name.c_str())];
+    }
+
+    bool LocalFileExists(const std::string& name)
+    {
+        return FileExists(GetLocalFilePath(name));
+    }
+
+    bool CheckFileWritable(const std::string& filepath)
+    {
+        FileHandle* file = OpenFile(filepath, FileMode::Write | FileMode::Append);
+        if (file == nullptr) return false;
+        return CloseFile(file);
+    }
+
+    bool CheckLocalFileWritable(const std::string& filepath)
+    {
+        FileHandle* file = OpenLocalFile(filepath, FileMode::Write | FileMode::Append);
+        if (file == nullptr) return false;
+        return CloseFile(file);
+    }
+
+    bool CloseFile(FileHandle* file)
+    {
+        return file != nullptr && fclose(AsFILE(file)) == 0;
+    }
+
+    bool IsEndOfFile(FileHandle* file)
+    {
+        return file != nullptr && feof(AsFILE(file));
+    }
+
+    bool FileReadLine(char* str, int count, FileHandle* file)
+    {
+        return file != nullptr && fgets(str, count, AsFILE(file)) != nullptr;
+    }
+
+    u64 FilePosition(FileHandle* file)
+    {
+        if (file == nullptr) return 0;
+        return (u64)ftell(AsFILE(file));
+    }
+
+    bool FileSeek(FileHandle* file, s64 offset, FileSeekOrigin origin)
+    {
+        if (file == nullptr) return false;
+
+        int whence = SEEK_SET;
+        switch (origin)
+        {
+            case FileSeekOrigin::Start: whence = SEEK_SET; break;
+            case FileSeekOrigin::Current: whence = SEEK_CUR; break;
+            case FileSeekOrigin::End: whence = SEEK_END; break;
+        }
+
+        return fseek(AsFILE(file), (long)offset, whence) == 0;
+    }
+
+    void FileRewind(FileHandle* file)
+    {
+        if (file != nullptr) rewind(AsFILE(file));
+    }
+
+    u64 FileRead(void* data, u64 size, u64 count, FileHandle* file)
+    {
+        if (file == nullptr) return 0;
+        return fread(data, (size_t)size, (size_t)count, AsFILE(file));
+    }
+
+    bool FileFlush(FileHandle* file)
+    {
+        return file != nullptr && fflush(AsFILE(file)) == 0;
+    }
+
+    u64 FileWrite(const void* data, u64 size, u64 count, FileHandle* file)
+    {
+        if (file == nullptr) return 0;
+        return fwrite(data, (size_t)size, (size_t)count, AsFILE(file));
+    }
+
+    u64 FileWriteFormatted(FileHandle* file, const char* fmt, ...)
+    {
+        if (file == nullptr) return 0;
+
+        va_list args;
+        va_start(args, fmt);
+        int written = vfprintf(AsFILE(file), fmt, args);
+        va_end(args);
+        return written < 0 ? 0 : (u64)written;
+    }
+
+    u64 FileLength(FileHandle* file)
+    {
+        if (file == nullptr) return 0;
+
+        long pos = ftell(AsFILE(file));
+        fseek(AsFILE(file), 0, SEEK_END);
+        long len = ftell(AsFILE(file));
+        fseek(AsFILE(file), pos, SEEK_SET);
+        return len < 0 ? 0 : (u64)len;
+    }
+
+    void Log(LogLevel level, const char* fmt, ...)
+    {
+        (void)level;
+        va_list args;
+        va_start(args, fmt);
+        vprintf(fmt, args);
+        va_end(args);
+    }
+
     Thread* Thread_Create(std::function<void()> func)
     {
         NSThread *thread = [[NSThread alloc] initWithBlock:^{
             func();
         }];
-        
+
         thread.name = @"MelonDS - Rendering";
         thread.qualityOfService = NSQualityOfServiceUserInitiated;
-        
         [thread start];
-        
         return (Thread *)CFBridgingRetain(thread);
     }
-    
+
     void Thread_Free(Thread *thread)
     {
         NSThread *nsThread = (NSThread *)CFBridgingRelease(thread);
         [nsThread cancel];
     }
-    
+
     void Thread_Wait(Thread *thread)
     {
         NSThread *nsThread = (__bridge NSThread *)thread;
-        while (nsThread.isExecuting)
-        {
-            continue;
-        }
+        while (nsThread.isExecuting) { continue; }
     }
-    
+
     Semaphore *Semaphore_Create()
     {
         dispatch_semaphore_t dispatchSemaphore = dispatch_semaphore_create(0);
         return (Semaphore *)CFBridgingRetain(dispatchSemaphore);
     }
-    
+
     void Semaphore_Free(Semaphore *semaphore)
     {
         CFRelease(semaphore);
     }
-    
+
     void Semaphore_Reset(Semaphore *semaphore)
     {
         dispatch_semaphore_t dispatchSemaphore = (__bridge dispatch_semaphore_t)semaphore;
-        while (dispatch_semaphore_wait(dispatchSemaphore, DISPATCH_TIME_NOW) == 0)
-        {
-            continue;
-        }
+        while (dispatch_semaphore_wait(dispatchSemaphore, DISPATCH_TIME_NOW) == 0) { continue; }
     }
-    
+
     void Semaphore_Wait(Semaphore *semaphore)
     {
         dispatch_semaphore_t dispatchSemaphore = (__bridge dispatch_semaphore_t)semaphore;
         dispatch_semaphore_wait(dispatchSemaphore, DISPATCH_TIME_FOREVER);
     }
 
+    bool Semaphore_TryWait(Semaphore* sema, int timeout_ms)
+    {
+        dispatch_semaphore_t dispatchSemaphore = (__bridge dispatch_semaphore_t)sema;
+        dispatch_time_t timeout = timeout_ms <= 0 ? DISPATCH_TIME_NOW : dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ms * NSEC_PER_MSEC);
+        return dispatch_semaphore_wait(dispatchSemaphore, timeout) == 0;
+    }
+
     void Semaphore_Post(Semaphore *semaphore, int count)
     {
         dispatch_semaphore_t dispatchSemaphore = (__bridge dispatch_semaphore_t)semaphore;
-        for (int i = 0; i < count; i++)
-        {
-            dispatch_semaphore_signal(dispatchSemaphore);
-        }
+        for (int i = 0; i < count; i++) { dispatch_semaphore_signal(dispatchSemaphore); }
     }
 
     Mutex *Mutex_Create()
     {
-        // NSLock is too slow for real-time audio, so use pthread_mutex_t directly.
-        
         pthread_mutex_t *mutex = (pthread_mutex_t *)malloc(sizeof(pthread_mutex_t));
         pthread_mutex_init(mutex, NULL);
         return (Mutex *)mutex;
@@ -1125,101 +1186,156 @@ namespace Platform
         pthread_mutex_t *mutex = (pthread_mutex_t *)m;
         pthread_mutex_unlock(mutex);
     }
-    
-    void *GL_GetProcAddress(const char* proc)
+
+    bool Mutex_TryLock(Mutex *m)
     {
-        return NULL;
-    }
-    
-    bool MP_Init()
-    {
-        return false;
-    }
-    
-    void MP_DeInit()
-    {
+        pthread_mutex_t *mutex = (pthread_mutex_t *)m;
+        return pthread_mutex_trylock(mutex) == 0;
     }
 
-    void MP_Begin()
+    void Sleep(u64 usecs)
     {
+        usleep((useconds_t)usecs);
     }
 
-    void MP_End()
+    u64 GetMSCount()
     {
-    }
-    
-    int MP_SendPacket(u8* data, int len, u64 timestamp)
-    {
-        return 0;
-    }
-    
-    int MP_RecvPacket(u8* data, u64* timestamp)
-    {
-        return 0;
+        return (u64)(CFAbsoluteTimeGetCurrent() * 1000.0);
     }
 
-    int MP_SendCmd(u8* data, int len, u64 timestamp)
+    u64 GetUSCount()
     {
-        return 0;
+        return (u64)(CFAbsoluteTimeGetCurrent() * 1000000.0);
     }
 
-    int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid)
+    void WriteNDSSave(const u8* savebytes, u32 savelen, u32 writeoffset, u32 writelen, void* userdata)
     {
-        return 0;
+        (void)writeoffset;
+        (void)writelen;
+        (void)userdata;
+        MelonDSEmulatorBridge.sharedBridge.saveData = [NSData dataWithBytes:savebytes length:savelen];
     }
 
-    int MP_SendAck(u8* data, int len, u64 timestamp)
+    void WriteGBASave(const u8* savebytes, u32 savelen, u32 writeoffset, u32 writelen, void* userdata)
     {
-        return 0;
+        (void)writeoffset;
+        (void)writelen;
+        (void)userdata;
+        MelonDSEmulatorBridge.sharedBridge.gbaSaveData = [NSData dataWithBytes:savebytes length:savelen];
     }
 
-    int MP_RecvHostPacket(u8* data, u64* timestamp)
+    void WriteFirmware(const Firmware& firmware, u32 writeoffset, u32 writelen, void* userdata)
     {
-        return 0;
+        (void)firmware;
+        (void)writeoffset;
+        (void)writelen;
+        (void)userdata;
     }
 
-    u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask)
+    void WriteDateTime(int year, int month, int day, int hour, int minute, int second, void* userdata)
     {
-        return 0;
+        (void)year; (void)month; (void)day; (void)hour; (void)minute; (void)second; (void)userdata;
     }
-    
-    bool LAN_Init()
+
+    void MP_Begin(void* userdata)
     {
-        if (![[MelonDSEmulatorBridge sharedBridge] isWFCEnabled])
-        {
-            return false;
-        }
-        
-        if (!LAN_Socket::Init())
-        {
-            return false;
-        }
-        
-        return true;
+        (void)userdata;
+        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+        sRegularPackets.clear();
+        sHostPackets.clear();
+        sReplyPackets.clear();
+        sAckPackets.clear();
     }
-    
-    void LAN_DeInit()
+
+    void MP_End(void* userdata)
     {
-        LAN_Socket::DeInit();
+        (void)userdata;
+        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+        sRegularPackets.clear();
+        sHostPackets.clear();
+        sReplyPackets.clear();
+        sAckPackets.clear();
     }
-    
-    int LAN_SendPacket(u8* data, int len)
+
+    static int PublishMultiplayerPacket(u8* data, int len, u64 timestamp, MelonDSMultiplayerPacketType type)
     {
+        if (len <= 0) return 0;
+        NSData *packet = [NSData dataWithBytes:data length:len];
+        NSDictionary *userInfo = @{@"packet": packet, @"type": @(type), @"timestamp": @(timestamp)};
+        [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSEmulatorBridge.didProduceMultiplayerPacketNotification object:MelonDSEmulatorBridge.sharedBridge userInfo:userInfo];
+        return len;
+    }
+
+    int MP_SendPacket(u8* data, int len, u64 timestamp, void* userdata)
+    {
+        (void)userdata;
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeRegular);
+    }
+
+    int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
+    {
+        (void)userdata;
+        return DequeuePacket(sRegularPackets, data, timestamp);
+    }
+
+    int MP_SendCmd(u8* data, int len, u64 timestamp, void* userdata)
+    {
+        (void)userdata;
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeCommand);
+    }
+
+    int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata)
+    {
+        (void)aid;
+        (void)userdata;
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeReply);
+    }
+
+    int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata)
+    {
+        (void)userdata;
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeAck);
+    }
+
+    int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
+    {
+        (void)userdata;
+        return DequeuePacket(sHostPackets, data, timestamp);
+    }
+
+    u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
+    {
+        (void)timestamp;
+        (void)userdata;
+        int len = DequeuePacket(sReplyPackets, data, nullptr);
+        return len > 0 ? aidmask : 0;
+    }
+
+    int Net_SendPacket(u8* data, int len, void* userdata)
+    {
+        (void)userdata;
+        if (![[MelonDSEmulatorBridge sharedBridge] isWFCEnabled]) return 0;
         return LAN_Socket::SendPacket(data, len);
     }
-    
-    int LAN_RecvPacket(u8* data)
+
+    int Net_RecvPacket(u8* data, void* userdata)
     {
+        (void)userdata;
+        if (![[MelonDSEmulatorBridge sharedBridge] isWFCEnabled]) return 0;
         return LAN_Socket::RecvPacket(data);
     }
 
-    void Mic_Prepare()
+    void Camera_Start(int num, void* userdata) { (void)num; (void)userdata; }
+    void Camera_Stop(int num, void* userdata) { (void)num; (void)userdata; }
+    void Camera_CaptureFrame(int num, u32* frame, int width, int height, bool yuv, void* userdata)
     {
-        if (![MelonDSEmulatorBridge.sharedBridge isMicrophoneEnabled] || [MelonDSEmulatorBridge.sharedBridge.audioEngine isRunning])
-        {
-            return;
-        }
-        
+        (void)num; (void)frame; (void)width; (void)height; (void)yuv; (void)userdata;
+    }
+
+    void Mic_Start(void* userdata)
+    {
+        (void)userdata;
+        if (![MelonDSEmulatorBridge.sharedBridge isMicrophoneEnabled] || [MelonDSEmulatorBridge.sharedBridge.audioEngine isRunning]) return;
         NSError *error = nil;
         if (![MelonDSEmulatorBridge.sharedBridge.audioEngine startAndReturnError:&error])
         {
@@ -1227,29 +1343,33 @@ namespace Platform
         }
     }
 
-    void WriteNDSSave(const u8* savebytes, u32 savelen, u32 writeoffset, u32 writelen)
+    void Mic_Stop(void* userdata)
     {
-        //TODO: Flush to disk automatically
-        NSData *saveData = [NSData dataWithBytes:savebytes length:savelen];
-        MelonDSEmulatorBridge.sharedBridge.saveData = saveData;
+        (void)userdata;
+        [MelonDSEmulatorBridge.sharedBridge.audioEngine stop];
     }
 
-    void WriteGBASave(const u8* savebytes, u32 savelen, u32 writeoffset, u32 writelen)
+    int Mic_ReadInput(s16* data, int maxlength, void* userdata)
     {
-        //TODO: Flush to disk automatically
-        NSData *saveData = [NSData dataWithBytes:savebytes length:savelen];
-        MelonDSEmulatorBridge.sharedBridge.gbaSaveData = saveData;
+        (void)userdata;
+        NSInteger readBytes = [MelonDSEmulatorBridge.sharedBridge.microphoneBuffer readIntoBuffer:data preferredSize:maxlength * (int)sizeof(int16_t)];
+        return (int)(readBytes / (NSInteger)sizeof(int16_t));
     }
 
-    void Camera_Start(int num)
+    AACDecoder* AAC_Init() { return nullptr; }
+    void AAC_DeInit(AACDecoder* dec) { (void)dec; }
+    bool AAC_Configure(AACDecoder* dec, int frequency, int channels) { (void)dec; (void)frequency; (void)channels; return false; }
+    bool AAC_DecodeFrame(AACDecoder* dec, const void* input, int inputlen, void* output, int outputlen)
     {
+        (void)dec; (void)input; (void)inputlen; (void)output; (void)outputlen; return false;
     }
 
-    void Camera_Stop(int num)
-    {
-    }
+    bool Addon_KeyDown(KeyType type, void* userdata) { (void)type; (void)userdata; return false; }
+    void Addon_RumbleStart(u32 len, void* userdata) { (void)len; (void)userdata; }
+    void Addon_RumbleStop(void* userdata) { (void)userdata; }
+    float Addon_MotionQuery(MotionQueryType type, void* userdata) { (void)type; (void)userdata; return 0.0f; }
 
-    void Camera_CaptureFrame(int num, u32* frame, int width, int height, bool yuv)
-    {
-    }
+    DynamicLibrary* DynamicLibrary_Load(const char* lib) { (void)lib; return nullptr; }
+    void DynamicLibrary_Unload(DynamicLibrary* lib) { (void)lib; }
+    void* DynamicLibrary_LoadFunction(DynamicLibrary* lib, const char* name) { (void)lib; (void)name; return nullptr; }
 }

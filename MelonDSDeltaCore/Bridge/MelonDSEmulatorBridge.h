@@ -18,6 +18,17 @@ typedef NS_ENUM(NSInteger, MelonDSSystemType)
     MelonDSSystemTypeDSi NS_SWIFT_NAME(dsi) = 1
 };
 
+// MARK: - Local Multiplayer Bridging
+// Multiplayer packet types used by melonDS MP_* callbacks.
+typedef NS_ENUM(NSInteger, MelonDSMultiplayerPacketType)
+{
+    MelonDSMultiplayerPacketTypeRegular = 0,
+    MelonDSMultiplayerPacketTypeCommand = 1,
+    MelonDSMultiplayerPacketTypeReply = 2,
+    MelonDSMultiplayerPacketTypeAck = 3,
+};
+
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Weverything" // Silence "Cannot find protocol definition" warning due to forward declaration.
 @interface MelonDSEmulatorBridge : NSObject <DLTAEmulatorBridging>
@@ -40,6 +51,17 @@ typedef NS_ENUM(NSInteger, MelonDSSystemType)
 
 @property (nonatomic, copy, nullable) NSURL *gbaGameURL;
 @property (nonatomic, copy, nullable) NSString *wfcDNS;
+
+
+/// Posted whenever melonDS emits an outbound multiplayer packet.
+/// userInfo keys:
+/// - @"packet": NSData
+/// - @"type": NSNumber (MelonDSMultiplayerPacketType)
+/// - @"timestamp": NSNumber (uint64)
+@property (class, nonatomic, readonly) NSNotificationName didProduceMultiplayerPacketNotification;
+
+/// Enqueues an inbound multiplayer packet for consumption by melonDS MP_Recv* callbacks.
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp;
 
 @end
 
