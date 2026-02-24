@@ -21,39 +21,32 @@
 #endif
 
 #include "melonDS/src/Platform.h"
+#include "melonDS/src/Args.h"
 #include "melonDS/src/NDS.h"
+#include "melonDS/src/DSi.h"
 #include "melonDS/src/SPU.h"
 #include "melonDS/src/GPU.h"
 #include "melonDS/src/AREngine.h"
+#include "melonDS/src/NDSCart.h"
+#include "melonDS/src/GBACart.h"
+#include "melonDS/src/GPU3D_Soft.h"
+#include "melonDS/src/version.h"
 
 #include "melonDS/src/frontend/qt_sdl/Config.h"
-#include "melonDS/src/frontend/qt_sdl/LAN_Socket.h"
 
 #include <memory>
+#include <optional>
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <algorithm>
 #include <cstdarg>
 #include <unistd.h>
 
 #import <notify.h>
 #import <pthread.h>
 
-namespace WifiAP
-{
-extern int ClientStatus;
-}
-
-namespace SPI_Firmware
-{
-extern u8* Firmware;
-extern u32 FirmwareLength;
-extern u32 FirmwareMask;
-
-extern std::array<u8, 4> DNS;
-extern int64_t wfcID;
-extern int64_t wfcFlags; // Required to ensure we don't generate invalid WFC ID after erasing WFC configuration
-}
+using namespace melonDS;
 
 // Copied from melonDS source (no longer exists in HEAD)
 void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever this should be named?
@@ -146,6 +139,7 @@ namespace
     struct MultiplayerPacket
     {
         MelonDSMultiplayerPacketType type;
+        uint16_t aid;
         uint64_t timestamp;
         std::vector<u8> payload;
     };
@@ -154,7 +148,6 @@ namespace
     std::deque<MultiplayerPacket> sRegularPackets;
     std::deque<MultiplayerPacket> sHostPackets;
     std::deque<MultiplayerPacket> sReplyPackets;
-    std::deque<MultiplayerPacket> sAckPackets;
 
     std::deque<MultiplayerPacket> &QueueForType(MelonDSMultiplayerPacketType type)
     {
@@ -162,7 +155,7 @@ namespace
         {
             case MelonDSMultiplayerPacketTypeCommand: return sHostPackets;
             case MelonDSMultiplayerPacketTypeReply: return sReplyPackets;
-            case MelonDSMultiplayerPacketTypeAck: return sAckPackets;
+            case MelonDSMultiplayerPacketTypeAck: return sHostPackets;
             case MelonDSMultiplayerPacketTypeRegular:
             default:
                 return sRegularPackets;
@@ -188,6 +181,194 @@ namespace
         memcpy(data, packet.payload.data(), packet.payload.size());
         return (int)packet.payload.size();
     }
+
+    u16 DequeueReplies(u8 *data, u64 timestamp, u16 aidmask)
+    {
+        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+        if (sReplyPackets.empty())
+        {
+            return 0;
+        }
+
+        u16 receivedMask = 0;
+
+        while (!sReplyPackets.empty())
+        {
+            MultiplayerPacket packet = std::move(sReplyPackets.front());
+            sReplyPackets.pop_front();
+
+            if (packet.payload.empty())
+            {
+                continue;
+            }
+
+            // Mirror LocalMP behavior by dropping stale replies.
+            if (packet.timestamp < timestamp && (timestamp - packet.timestamp) > 32)
+            {
+                continue;
+            }
+
+            u16 aid = packet.aid;
+            if (aid == 0 || aid >= 16)
+            {
+                continue;
+            }
+
+            size_t offset = (size_t)(aid - 1) * 1024;
+            size_t copyLength = std::min(packet.payload.size(), (size_t)1024);
+            memcpy(data + offset, packet.payload.data(), copyLength);
+            receivedMask |= (1 << aid);
+
+            if ((receivedMask & aidmask) == aidmask)
+            {
+                break;
+            }
+        }
+
+        return receivedMask;
+    }
+
+    std::unique_ptr<melonDS::NDS> sNDSInstance;
+
+    template <typename TImage>
+    std::unique_ptr<TImage> LoadFixedImage(NSURL *url, NSString *name)
+    {
+        NSError *error = nil;
+        NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&error];
+        if (data == nil)
+        {
+            NSLog(@"Failed to load %@. %@", name, error);
+            return nullptr;
+        }
+
+        if (data.length != sizeof(TImage))
+        {
+            NSLog(@"Invalid %@ size: %zu (expected %zu).", name, (size_t)data.length, sizeof(TImage));
+            return nullptr;
+        }
+
+        auto image = std::make_unique<TImage>();
+        memcpy(image->data(), data.bytes, sizeof(TImage));
+        return image;
+    }
+
+    std::optional<melonDS::Firmware> LoadFirmwareImage(NSURL *url, NSString *name)
+    {
+        NSError *error = nil;
+        NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&error];
+        if (data == nil)
+        {
+            NSLog(@"Failed to load %@. %@", name, error);
+            return std::nullopt;
+        }
+
+        melonDS::Firmware firmware((const u8 *)data.bytes, (u32)data.length);
+        if (firmware.Buffer() == nullptr)
+        {
+            NSLog(@"Invalid %@ image.", name);
+            return std::nullopt;
+        }
+
+        return firmware;
+    }
+
+    std::optional<melonDS::DSi_NAND::NANDImage> LoadDSiNANDImage(NSURL *url, const melonDS::DSiBIOSImage &arm7iBIOS)
+    {
+        std::string path = std::string(url.fileSystemRepresentation);
+        Platform::FileHandle *file = Platform::OpenFile(path, Platform::FileMode::ReadWriteExisting);
+        if (file == nullptr)
+        {
+            NSLog(@"Failed to open DSi NAND at %@.", url.path);
+            return std::nullopt;
+        }
+
+        melonDS::DSi_NAND::NANDImage nandImage(file, &arm7iBIOS[0x8308]);
+        if (!nandImage)
+        {
+            NSLog(@"Failed to parse DSi NAND image.");
+            return std::nullopt;
+        }
+
+        return std::optional<melonDS::DSi_NAND::NANDImage>(std::move(nandImage));
+    }
+
+    std::unique_ptr<melonDS::NDS> CreateConsole(MelonDSEmulatorBridge *bridge, bool useExternalBIOS)
+    {
+        melonDS::NDSArgs ndsArgs;
+        ndsArgs.JIT = std::nullopt;
+        ndsArgs.OutputSampleRate = 32768.0;
+        ndsArgs.Renderer3D = std::make_unique<melonDS::SoftRenderer>();
+
+        if (useExternalBIOS)
+        {
+            auto arm9BIOS = LoadFixedImage<melonDS::ARM9BIOSImage>(bridge.bios9URL, @"DS ARM9 BIOS");
+            auto arm7BIOS = LoadFixedImage<melonDS::ARM7BIOSImage>(bridge.bios7URL, @"DS ARM7 BIOS");
+            auto dsFirmware = LoadFirmwareImage(bridge.firmwareURL, @"DS firmware");
+            if (arm9BIOS == nullptr || arm7BIOS == nullptr || !dsFirmware.has_value())
+            {
+                return nullptr;
+            }
+
+            ndsArgs.ARM9BIOS = std::move(arm9BIOS);
+            ndsArgs.ARM7BIOS = std::move(arm7BIOS);
+            ndsArgs.Firmware = std::move(*dsFirmware);
+        }
+        else
+        {
+            // Fall back to generated firmware + FreeBIOS if external assets are unavailable.
+            ndsArgs.Firmware = melonDS::Firmware(0);
+        }
+
+        if (bridge.systemType == MelonDSSystemTypeDSi)
+        {
+            auto arm9iBIOS = LoadFixedImage<melonDS::DSiBIOSImage>(bridge.dsiBIOS9URL, @"DSi ARM9 BIOS");
+            auto arm7iBIOS = LoadFixedImage<melonDS::DSiBIOSImage>(bridge.dsiBIOS7URL, @"DSi ARM7 BIOS");
+            auto dsiFirmware = LoadFirmwareImage(bridge.dsiFirmwareURL, @"DSi firmware");
+            if (arm9iBIOS == nullptr || arm7iBIOS == nullptr || !dsiFirmware.has_value())
+            {
+                return nullptr;
+            }
+
+            auto nandImage = LoadDSiNANDImage(bridge.dsiNANDURL, *arm7iBIOS);
+            if (!nandImage.has_value())
+            {
+                return nullptr;
+            }
+
+            ndsArgs.Firmware = std::move(*dsiFirmware);
+
+            melonDS::DSiArgs dsiArgs {
+                std::move(ndsArgs),
+                std::move(arm9iBIOS),
+                std::move(arm7iBIOS),
+                std::move(*nandImage),
+                std::nullopt,
+                false,
+                false,
+            };
+            return std::make_unique<melonDS::DSi>(std::move(dsiArgs), (__bridge void *)bridge);
+        }
+
+        return std::make_unique<melonDS::NDS>(std::move(ndsArgs), (__bridge void *)bridge);
+    }
+
+    melonDS::NDS *CurrentNDS()
+    {
+        return sNDSInstance.get();
+    }
+
+    void SetCurrentNDS(std::unique_ptr<melonDS::NDS> nds)
+    {
+        sNDSInstance = std::move(nds);
+    }
+
+    void ConfigureRenderer(melonDS::NDS &nds)
+    {
+        if (auto *renderer = dynamic_cast<melonDS::SoftRenderer *>(&nds.GetRenderer3D()))
+        {
+            renderer->SetThreaded(true, nds.GPU);
+        }
+    }
 }
 
 @implementation MelonDSEmulatorBridge
@@ -207,12 +388,22 @@ namespace
     return _emulatorBridge;
 }
 
++ (NSString *)melonDSVersion
+{
+    return @(MELONDS_VERSION);
+}
+
 + (NSNotificationName)didProduceMultiplayerPacketNotification
 {
     return MelonDSDidProduceMultiplayerPacketNotification;
 }
 
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp
+{
+    [self enqueueMultiplayerPacket:packet type:type timestamp:timestamp aid:0];
+}
+
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid
 {
     if (packet.length == 0)
     {
@@ -221,6 +412,7 @@ namespace
 
     MultiplayerPacket incomingPacket;
     incomingPacket.type = type;
+    incomingPacket.aid = aid;
     incomingPacket.timestamp = timestamp;
     incomingPacket.payload.resize(packet.length);
     memcpy(incomingPacket.payload.data(), packet.bytes, packet.length);
@@ -254,98 +446,72 @@ namespace
 
 - (void)startWithGameURL:(NSURL *)gameURL
 {
-    if (self.wfcDNS != nil)
-    {
-        NSArray *components = [self.wfcDNS componentsSeparatedByString:@"."];
-        if (components.count == 4)
-        {
-            SPI_Firmware::DNS = { (u8)[components[0] intValue], (u8)[components[1] intValue], (u8)[components[2] intValue], (u8)[components[3] intValue] };
-        }
-        else
-        {
-            SPI_Firmware::DNS = { 0, 0, 0, 0 };
-        }
-    }
-    else
-    {
-        SPI_Firmware::DNS = { 0, 0, 0, 0 };
-    }
-
-    int64_t wfcID = [[[NSUserDefaults standardUserDefaults] objectForKey:MelonDSWFCIDUserDefaultsKey] longLongValue];
-    int64_t wfcFlags = [[[NSUserDefaults standardUserDefaults] objectForKey:MelonDSWFCFlagsUserDefaultsKey] longLongValue];
-
-    if (wfcID != 0)
-    {
-        SPI_Firmware::wfcID = wfcID;
-        SPI_Firmware::wfcFlags = wfcFlags;
-    }
-    else
-    {
-        SPI_Firmware::wfcID = 0;
-        SPI_Firmware::wfcFlags = 0;
-    }
-
     self.gameURL = gameURL;
 
-    if ([self isInitialized])
+    Config::Load();
+
+    Config::Table globalConfig = Config::GetGlobalTable();
+    globalConfig.SetString("Firmware.Username", "Delta");
+    globalConfig.SetInt("Firmware.BirthdayDay", 7);
+    globalConfig.SetInt("Firmware.BirthdayMonth", 10);
+
+    globalConfig.SetString("DS.BIOS7Path", self.bios7URL.lastPathComponent.UTF8String);
+    globalConfig.SetString("DS.BIOS9Path", self.bios9URL.lastPathComponent.UTF8String);
+    globalConfig.SetString("DS.FirmwarePath", self.firmwareURL.lastPathComponent.UTF8String);
+
+    globalConfig.SetString("DSi.BIOS7Path", self.dsiBIOS7URL.lastPathComponent.UTF8String);
+    globalConfig.SetString("DSi.BIOS9Path", self.dsiBIOS9URL.lastPathComponent.UTF8String);
+    globalConfig.SetString("DSi.FirmwarePath", self.dsiFirmwareURL.lastPathComponent.UTF8String);
+    globalConfig.SetString("DSi.NANDPath", self.dsiNANDURL.lastPathComponent.UTF8String);
+
+    bool hasExternalDSBIOS = [[NSFileManager defaultManager] fileExistsAtPath:self.bios7URL.path] &&
+                             [[NSFileManager defaultManager] fileExistsAtPath:self.bios9URL.path] &&
+                             [[NSFileManager defaultManager] fileExistsAtPath:self.firmwareURL.path];
+    globalConfig.SetBool("Emu.ExternalBIOSEnable", hasExternalDSBIOS);
+    globalConfig.SetInt("Emu.ConsoleType", (int)self.systemType);
+
+    if (![self isInitialized])
     {
-        NDS::DeInit();
-    }
-    else
-    {
-        Config::Load();
-
-        Config::FirmwareUsername = "Delta";
-        Config::FirmwareBirthdayDay = 7;
-        Config::FirmwareBirthdayMonth = 10;
-
-        // DS paths
-        Config::BIOS7Path = self.bios7URL.lastPathComponent.UTF8String;
-        Config::BIOS9Path = self.bios9URL.lastPathComponent.UTF8String;
-        Config::FirmwarePath = self.firmwareURL.lastPathComponent.UTF8String;
-
-        // DSi paths
-        Config::DSiBIOS7Path = self.dsiBIOS7URL.lastPathComponent.UTF8String;
-        Config::DSiBIOS9Path = self.dsiBIOS9URL.lastPathComponent.UTF8String;
-        Config::DSiFirmwarePath = self.dsiFirmwareURL.lastPathComponent.UTF8String;
-        Config::DSiNANDPath = self.dsiNANDURL.lastPathComponent.UTF8String;
-
         [self registerForNotifications];
-
-        // Renderer is not deinitialized in NDS::DeInit, so initialize it only once.
-        GPU::InitRenderer(0);
     }
+
+    if (melonDS::NDS *existingConsole = CurrentNDS())
+    {
+        BOOL wasStopping = self.stopping;
+        self.stopping = YES;
+        if (existingConsole->IsRunning())
+        {
+            existingConsole->Stop();
+        }
+        self.stopping = wasStopping;
+    }
+    SetCurrentNDS(nullptr);
+
+    std::unique_ptr<melonDS::NDS> console = CreateConsole(self, hasExternalDSBIOS);
+    if (console == nullptr)
+    {
+        self.initialized = NO;
+        NSLog(@"Failed to initialize melonDS console instance.");
+        return;
+    }
+
+    SetCurrentNDS(std::move(console));
+    melonDS::NDS *nds = CurrentNDS();
+    if (nds == nullptr)
+    {
+        self.initialized = NO;
+        NSLog(@"Failed to initialize melonDS console instance.");
+        return;
+    }
+
+    ConfigureRenderer(*nds);
 
     [self prepareAudioEngine];
 
-    NDS::SetConsoleType((int)self.systemType);
-
-    // AltJIT does not yet support melonDS 0.9.5.
-    // Config::JIT_Enable = [self isJITEnabled];
-    // Config::JIT_FastMemory = NO;
-
-    if ([[NSFileManager defaultManager] fileExistsAtPath:self.bios7URL.path] &&
-        [[NSFileManager defaultManager] fileExistsAtPath:self.bios9URL.path] &&
-        [[NSFileManager defaultManager] fileExistsAtPath:self.firmwareURL.path])
-    {
-        // User has provided BIOS files, so prefer using them.
-        Config::ExternalBIOSEnable = true;
-    }
-    else
-    {
-        // External BIOS files don't exist, so fall back to internal BIOS.
-        Config::ExternalBIOSEnable = false;
-    }
-
-    NDS::Init();
+    nds->Reset();
     self.initialized = YES;
-
-    GPU::RenderSettings settings;
-    settings.Soft_Threaded = YES;
-
-    GPU::SetRenderSettings(0, settings);
-
-    NDS::Reset();
+    self.saveData = nil;
+    self.gbaSaveData = nil;
     self.gbaSaveURL = nil;
 
     BOOL isDirectory = NO;
@@ -361,16 +527,18 @@ namespace
             return;
         }
 
-        if (NDS::LoadCart((const u8 *)romData.bytes, (u32)romData.length, NULL, 0))
+        auto ndsCart = melonDS::NDSCart::ParseROM((const u8 *)romData.bytes, (u32)romData.length, (__bridge void *)self);
+        if (ndsCart != nullptr)
         {
-            NDS::SetupDirectBoot(gameURL.lastPathComponent.UTF8String);
+            nds->SetNDSCart(std::move(ndsCart));
+            nds->SetupDirectBoot(gameURL.lastPathComponent.UTF8String);
         }
         else
         {
             NSLog(@"Failed to load Nintendo DS ROM.");
         }
 
-        if (self.gbaGameURL != nil)
+        if (self.gbaGameURL != nil && nds->ConsoleType == MelonDSSystemTypeDS)
         {
             NSData *gbaROMData = [NSData dataWithContentsOfURL:self.gbaGameURL options:0 error:&error];
             if (gbaROMData)
@@ -384,8 +552,12 @@ namespace
                     NSLog(@"Failed to load inserted GBA ROM save data. %@", error);
                 }
 
-                if (NDS::LoadGBACart((const u8 *)gbaROMData.bytes, (u32)gbaROMData.length, (const u8 *)saveData.bytes, (u32)saveData.length))
+                const u8 *saveBytes = (const u8 *)saveData.bytes;
+                u32 saveLength = (u32)saveData.length;
+                auto gbaCart = melonDS::GBACart::ParseROM((const u8 *)gbaROMData.bytes, (u32)gbaROMData.length, saveBytes, saveLength, (__bridge void *)self);
+                if (gbaCart != nullptr)
                 {
+                    nds->SetGBACart(std::move(gbaCart));
                     // Cache save URL so we don't accidentally overwrite save data for the wrong game when switching.
                     self.gbaSaveURL = gbaSaveURL;
                 }
@@ -402,19 +574,22 @@ namespace
     }
     else
     {
-        NDS::LoadBIOS();
+        nds->LoadBIOS();
     }
 
     self.stopping = NO;
 
-    NDS::Start();
+    nds->Start();
 }
 
 - (void)stop
 {
     self.stopping = YES;
 
-    NDS::Stop();
+    if (melonDS::NDS *nds = CurrentNDS())
+    {
+        nds->Stop();
+    }
 
     [self.audioEngine stop];
 
@@ -441,33 +616,37 @@ namespace
         return;
     }
 
-    int previousClientStatus = WifiAP::ClientStatus;
+    melonDS::NDS *nds = CurrentNDS();
+    if (nds == nullptr)
+    {
+        return;
+    }
 
     uint32_t inputs = self.activatedInputs;
     uint32_t inputsMask = 0xFFF; // 0b000000111111111111;
 
     uint16_t sanitizedInputs = inputsMask ^ inputs;
-    NDS::SetKeyMask(sanitizedInputs);
+    nds->SetKeyMask(sanitizedInputs);
 
     if (self.activatedInputs & MelonDSGameInputTouchScreenX || self.activatedInputs & MelonDSGameInputTouchScreenY)
     {
-        NDS::TouchScreen(self.touchScreenPoint.x, self.touchScreenPoint.y);
+        nds->TouchScreen(self.touchScreenPoint.x, self.touchScreenPoint.y);
     }
     else
     {
-        NDS::ReleaseScreen();
+        nds->ReleaseScreen();
     }
 
     if (self.activatedInputs & MelonDSGameInputLid)
     {
-        NDS::SetLidClosed(true);
+        nds->SetLidClosed(true);
         self.closedLidFrameCount = 0;
     }
-    else if (NDS::IsLidClosed())
+    else if (nds->IsLidClosed())
     {
         if (self.closedLidFrameCount >= 7) // Derived from quick experiments - 6 is too low for resuming iPad Pro from background non-AirPlay
         {
-            NDS::SetLidClosed(false);
+            nds->SetLidClosed(false);
             self.closedLidFrameCount = 0;
         }
         else
@@ -476,72 +655,50 @@ namespace
         }
     }
 
-    static int16_t micBuffer[735];
-    NSInteger readBytes = (NSInteger)[self.microphoneBuffer readIntoBuffer:micBuffer preferredSize:735 * sizeof(int16_t)];
-    NSInteger readFrames = readBytes / sizeof(int16_t);
-
-    if (readFrames > 0)
-    {
-        NDS::MicInputFrame(micBuffer, (int)readFrames);
-    }
-
     if ([self isJITEnabled])
     {
         // Skipping frames with JIT disabled can cause graphical bugs,
         // so limit frame skip to devices that support JIT (for now).
 
-        // JIT not currently supported with melonDS 0.9.5.
+        // JIT not currently supported with melonDS in Delta.
         // NDS::SetSkipFrame(!processVideo);
     }
 
-    NDS::RunFrame();
+    nds->RunFrame();
 
     static int16_t buffer[0x1000];
-    u32 availableBytes = SPU::GetOutputSize();
-    availableBytes = MAX(availableBytes, (u32)(sizeof(buffer) / (2 * sizeof(int16_t))));
+    u32 availableSamples = (u32)nds->SPU.GetOutputSize();
+    availableSamples = MAX(availableSamples, (u32)(sizeof(buffer) / (2 * sizeof(int16_t))));
 
-    int samples = SPU::ReadOutput(buffer, availableBytes);
+    int samples = nds->SPU.ReadOutput(buffer, (int)availableSamples);
     [self.audioRenderer.audioBuffer writeBuffer:buffer size:samples * 4];
 
     if (processVideo)
     {
         int screenBufferSize = 256 * 192 * 4;
 
-        memcpy(self.videoRenderer.videoBuffer, GPU::Framebuffer[GPU::FrontBuffer][0], screenBufferSize);
-        memcpy(self.videoRenderer.videoBuffer + screenBufferSize, GPU::Framebuffer[GPU::FrontBuffer][1], screenBufferSize);
+        memcpy(self.videoRenderer.videoBuffer, nds->GPU.Framebuffer[nds->GPU.FrontBuffer][0].get(), screenBufferSize);
+        memcpy(self.videoRenderer.videoBuffer + screenBufferSize, nds->GPU.Framebuffer[nds->GPU.FrontBuffer][1].get(), screenBufferSize);
 
         [self.videoRenderer processFrame];
-    }
-
-    if (WifiAP::ClientStatus != previousClientStatus)
-    {
-        if (WifiAP::ClientStatus == 0)
-        {
-            // Disconnected
-            [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSDidDisconnectFromWFCNotification object:self];
-        }
-        else if (WifiAP::ClientStatus == 2)
-        {
-            // Connected
-            [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSDidConnectToWFCNotification object:self];
-        }
     }
 }
 
 - (nullable NSData *)readMemoryAtAddress:(NSInteger)address size:(NSInteger)size
 {
-    if (NDS::MainRAM == NULL)
+    melonDS::NDS *nds = CurrentNDS();
+    if (nds == nullptr || nds->MainRAM == nullptr)
     {
         return nil;
     }
 
-    if (address + size > 0x1000000)
+    if (address + size > (NSInteger)nds->MainRAMMaxSize)
     {
         // Beyond RAM bounds, return nil.
         return nil;
     }
 
-    void *bytes = (NDS::MainRAM + address);
+    void *bytes = (nds->MainRAM + address);
     NSData *data = [NSData dataWithBytesNoCopy:bytes length:size freeWhenDone:NO];
     return data;
 }
@@ -620,30 +777,6 @@ namespace
         }
     }
 
-    if (SPI_Firmware::Firmware)
-    {
-        // Save WFC ID to NSUserDefaults
-
-        u32 userdata = 0x7FE00 & SPI_Firmware::FirmwareMask;
-        u32 apdata = userdata - 0x400;
-
-        int64_t wfcID = 0;
-        int64_t wfcFlags = 0;
-
-        memcpy(&wfcID, &SPI_Firmware::Firmware[apdata + 0xF0], 6);
-        memcpy(&wfcFlags, &SPI_Firmware::Firmware[apdata + 0xF6], 8);
-
-        if (wfcID != 0)
-        {
-            [[NSUserDefaults standardUserDefaults] setObject:@(wfcID) forKey:MelonDSWFCIDUserDefaultsKey];
-            [[NSUserDefaults standardUserDefaults] setObject:@(wfcFlags) forKey:MelonDSWFCFlagsUserDefaultsKey];
-        }
-        else
-        {
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:MelonDSWFCIDUserDefaultsKey];
-            [[NSUserDefaults standardUserDefaults] removeObjectForKey:MelonDSWFCFlagsUserDefaultsKey];
-        }
-    }
 }
 
 - (void)loadGameSaveFromURL:(NSURL *)fileURL
@@ -661,23 +794,59 @@ namespace
         return;
     }
 
-    NDS::LoadSave((const u8 *)saveData.bytes, (u32)saveData.length);
+    if (melonDS::NDS *nds = CurrentNDS())
+    {
+        nds->SetNDSSave((const u8 *)saveData.bytes, (u32)saveData.length);
+        self.saveData = saveData;
+    }
 }
 
 #pragma mark - Save States -
 
 - (void)saveSaveStateToURL:(NSURL *)URL
 {
-    Savestate *savestate = new Savestate(URL.fileSystemRepresentation, true);
-    NDS::DoSavestate(savestate);
-    delete savestate;
+    melonDS::NDS *nds = CurrentNDS();
+    if (nds == nullptr)
+    {
+        return;
+    }
+
+    melonDS::Savestate savestate;
+    if (!nds->DoSavestate(&savestate) || savestate.Error)
+    {
+        NSLog(@"Failed to create save state.");
+        return;
+    }
+
+    NSData *data = [NSData dataWithBytes:savestate.Buffer() length:savestate.Length()];
+    NSError *error = nil;
+    if (![data writeToURL:URL options:NSDataWritingAtomic error:&error])
+    {
+        NSLog(@"Failed write save state. %@", error);
+    }
 }
 
 - (void)loadSaveStateFromURL:(NSURL *)URL
 {
-    Savestate *savestate = new Savestate(URL.fileSystemRepresentation, false);
-    NDS::DoSavestate(savestate);
-    delete savestate;
+    melonDS::NDS *nds = CurrentNDS();
+    if (nds == nullptr)
+    {
+        return;
+    }
+
+    NSError *error = nil;
+    NSMutableData *data = [NSMutableData dataWithContentsOfURL:URL options:0 error:&error];
+    if (data == nil)
+    {
+        NSLog(@"Failed load save state. %@", error);
+        return;
+    }
+
+    melonDS::Savestate savestate(data.mutableBytes, (u32)data.length, false);
+    if (!nds->DoSavestate(&savestate) || savestate.Error)
+    {
+        NSLog(@"Failed to load save state.");
+    }
 }
 
 #pragma mark - Cheats -
@@ -704,30 +873,37 @@ namespace
     NSString *sanitizedCode = [[cheatCode componentsSeparatedByCharactersInSet:NSCharacterSet.hexadecimalCharacterSet.invertedSet] componentsJoinedByString:@""];
     u32 codeLength = (u32)(sanitizedCode.length / 8);
 
-    ARCode code;
+    ARCode code {};
+    code.Parent = &self.cheatCodes->RootCat;
     code.Name = sanitizedCode.UTF8String;
-    ParseTextCode((char *)sanitizedCode.UTF8String, (int)[sanitizedCode lengthOfBytesUsingEncoding:NSUTF8StringEncoding], &code.Code[0], 128);
+    code.Description = "";
     code.Enabled = YES;
-    code.CodeLen = codeLength;
+    code.Code.resize(codeLength);
 
-    ARCodeCat category;
-    category.Name = sanitizedCode.UTF8String;
-    category.Codes.push_back(code);
-
-    self.cheatCodes->Categories.push_back(category);
+    if (codeLength > 0)
+    {
+        ParseTextCode((char *)sanitizedCode.UTF8String, (int)[sanitizedCode lengthOfBytesUsingEncoding:NSUTF8StringEncoding], code.Code.data(), (int)codeLength);
+    }
+    self.cheatCodes->RootCat.Children.emplace_back(std::move(code));
 
     return YES;
 }
 
 - (void)resetCheats
 {
-    self.cheatCodes->Categories.clear();
-    AREngine::Reset();
+    self.cheatCodes->RootCat.Children.clear();
+    if (melonDS::NDS *nds = CurrentNDS())
+    {
+        nds->AREngine.Cheats.clear();
+    }
 }
 
 - (void)updateCheats
 {
-    AREngine::SetCodeFile(self.cheatCodes.get());
+    if (melonDS::NDS *nds = CurrentNDS())
+    {
+        nds->AREngine.Cheats = self.cheatCodes->GetCodes();
+    }
 }
 
 #pragma mark - Notifications -
@@ -1000,14 +1176,14 @@ namespace melonDS::Platform
 
     bool CheckFileWritable(const std::string& filepath)
     {
-        FileHandle* file = OpenFile(filepath, FileMode::Write | FileMode::Append);
+        FileHandle* file = OpenFile(filepath, static_cast<FileMode>(FileMode::Write | FileMode::Append));
         if (file == nullptr) return false;
         return CloseFile(file);
     }
 
     bool CheckLocalFileWritable(const std::string& filepath)
     {
-        FileHandle* file = OpenLocalFile(filepath, FileMode::Write | FileMode::Append);
+        FileHandle* file = OpenLocalFile(filepath, static_cast<FileMode>(FileMode::Write | FileMode::Append));
         if (file == nullptr) return false;
         return CloseFile(file);
     }
@@ -1244,7 +1420,6 @@ namespace melonDS::Platform
         sRegularPackets.clear();
         sHostPackets.clear();
         sReplyPackets.clear();
-        sAckPackets.clear();
     }
 
     void MP_End(void* userdata)
@@ -1254,14 +1429,13 @@ namespace melonDS::Platform
         sRegularPackets.clear();
         sHostPackets.clear();
         sReplyPackets.clear();
-        sAckPackets.clear();
     }
 
-    static int PublishMultiplayerPacket(u8* data, int len, u64 timestamp, MelonDSMultiplayerPacketType type)
+    static int PublishMultiplayerPacket(u8* data, int len, u64 timestamp, MelonDSMultiplayerPacketType type, u16 aid)
     {
         if (len <= 0) return 0;
         NSData *packet = [NSData dataWithBytes:data length:len];
-        NSDictionary *userInfo = @{@"packet": packet, @"type": @(type), @"timestamp": @(timestamp)};
+        NSDictionary *userInfo = @{@"packet": packet, @"type": @(type), @"timestamp": @(timestamp), @"aid": @(aid)};
         [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSEmulatorBridge.didProduceMultiplayerPacketNotification object:MelonDSEmulatorBridge.sharedBridge userInfo:userInfo];
         return len;
     }
@@ -1269,7 +1443,7 @@ namespace melonDS::Platform
     int MP_SendPacket(u8* data, int len, u64 timestamp, void* userdata)
     {
         (void)userdata;
-        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeRegular);
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeRegular, 0);
     }
 
     int MP_RecvPacket(u8* data, u64* timestamp, void* userdata)
@@ -1281,20 +1455,19 @@ namespace melonDS::Platform
     int MP_SendCmd(u8* data, int len, u64 timestamp, void* userdata)
     {
         (void)userdata;
-        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeCommand);
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeCommand, 0);
     }
 
     int MP_SendReply(u8* data, int len, u64 timestamp, u16 aid, void* userdata)
     {
-        (void)aid;
         (void)userdata;
-        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeReply);
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeReply, aid);
     }
 
     int MP_SendAck(u8* data, int len, u64 timestamp, void* userdata)
     {
         (void)userdata;
-        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeAck);
+        return PublishMultiplayerPacket(data, len, timestamp, MelonDSMultiplayerPacketTypeAck, 0);
     }
 
     int MP_RecvHostPacket(u8* data, u64* timestamp, void* userdata)
@@ -1305,24 +1478,25 @@ namespace melonDS::Platform
 
     u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
     {
-        (void)timestamp;
         (void)userdata;
-        int len = DequeuePacket(sReplyPackets, data, nullptr);
-        return len > 0 ? aidmask : 0;
+        return DequeueReplies(data, timestamp, aidmask);
     }
 
     int Net_SendPacket(u8* data, int len, void* userdata)
     {
+        (void)data;
+        (void)len;
         (void)userdata;
         if (![[MelonDSEmulatorBridge sharedBridge] isWFCEnabled]) return 0;
-        return LAN_Socket::SendPacket(data, len);
+        return 0;
     }
 
     int Net_RecvPacket(u8* data, void* userdata)
     {
+        (void)data;
         (void)userdata;
         if (![[MelonDSEmulatorBridge sharedBridge] isWFCEnabled]) return 0;
-        return LAN_Socket::RecvPacket(data);
+        return 0;
     }
 
     void Camera_Start(int num, void* userdata) { (void)num; (void)userdata; }

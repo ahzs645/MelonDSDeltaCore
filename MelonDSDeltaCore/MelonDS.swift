@@ -71,7 +71,7 @@ public struct MelonDS: DeltaCoreProtocol
     
     public var name: String { "melonDS" }
     public var identifier: String { "com.rileytestut.MelonDSDeltaCore" }
-    public var version: String? { "1.1" }
+    public var version: String? { MelonDSEmulatorBridge.melonDSVersion }
     
     public var gameType: GameType { GameType.ds }
     public var gameInputType: Input.Type { MelonDSGameInput.self }

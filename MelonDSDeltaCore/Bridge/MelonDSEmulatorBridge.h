@@ -35,6 +35,7 @@ typedef NS_ENUM(NSInteger, MelonDSMultiplayerPacketType)
 #pragma clang diagnostic pop
 
 @property (class, nonatomic, readonly) MelonDSEmulatorBridge *sharedBridge;
+@property (class, nonatomic, readonly) NSString *melonDSVersion;
 
 @property (nonatomic) MelonDSSystemType systemType;
 @property (nonatomic, getter=isJITEnabled) BOOL jitEnabled;
@@ -58,10 +59,12 @@ typedef NS_ENUM(NSInteger, MelonDSMultiplayerPacketType)
 /// - @"packet": NSData
 /// - @"type": NSNumber (MelonDSMultiplayerPacketType)
 /// - @"timestamp": NSNumber (uint64)
+/// - @"aid": NSNumber (uint16, only meaningful for MelonDSMultiplayerPacketTypeReply)
 @property (class, nonatomic, readonly) NSNotificationName didProduceMultiplayerPacketNotification;
 
 /// Enqueues an inbound multiplayer packet for consumption by melonDS MP_Recv* callbacks.
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp;
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid;
 
 @end
 
