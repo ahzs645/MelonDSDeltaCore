@@ -389,6 +389,141 @@ namespace
         }
     }
 
+    std::optional<melonDS::IpAddress> ParseIPv4AddressString(NSString *string)
+    {
+        if (string.length == 0)
+        {
+            return std::nullopt;
+        }
+
+        NSArray<NSString *> *components = [string componentsSeparatedByString:@"."];
+        if (components.count != 4)
+        {
+            return std::nullopt;
+        }
+
+        melonDS::IpAddress address {};
+
+        for (NSUInteger index = 0; index < components.count; index += 1)
+        {
+            NSString *component = [components[index] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+            if (component.length == 0)
+            {
+                return std::nullopt;
+            }
+
+            NSScanner *scanner = [NSScanner scannerWithString:component];
+            NSInteger value = 0;
+            if (![scanner scanInteger:&value] || !scanner.isAtEnd || value < 0 || value > 255)
+            {
+                return std::nullopt;
+            }
+
+            address[index] = (u8)value;
+        }
+
+        return address;
+    }
+
+    bool AccessPointHasSSID(const melonDS::Firmware::WifiAccessPoint &accessPoint)
+    {
+        return std::any_of(std::begin(accessPoint.SSID), std::end(accessPoint.SSID), [](char value) {
+            return value != '\0';
+        });
+    }
+
+    bool AccessPointNeedsRepair(const melonDS::Firmware::WifiAccessPoint &accessPoint)
+    {
+        if (accessPoint.Status != melonDS::Firmware::AccessPointStatus::Normal)
+        {
+            return true;
+        }
+
+        return !AccessPointHasSSID(accessPoint) || accessPoint.ConnectionConfigured == 0;
+    }
+
+    bool ApplyWFCConfigurationToFirmware(melonDS::Firmware &firmware, NSURL *url, NSString *dnsString)
+    {
+        if (firmware.Buffer() == nullptr)
+        {
+            return false;
+        }
+
+        auto &accessPoints = firmware.GetAccessPoints();
+        const bool hasUsableAccessPoint = std::any_of(accessPoints.begin(), accessPoints.end(), [](const auto &accessPoint) {
+            return !AccessPointNeedsRepair(accessPoint);
+        });
+
+        const int consoleType = (firmware.GetHeader().ConsoleType == melonDS::Firmware::FirmwareConsoleType::DSi) ? 1 : 0;
+        const std::optional<melonDS::IpAddress> dnsOverride = ParseIPv4AddressString(dnsString);
+
+        bool modified = false;
+
+        for (size_t index = 0; index < accessPoints.size(); index += 1)
+        {
+            auto &accessPoint = accessPoints[index];
+
+            // If none of the firmware slots are usable, seed slot 1 with melonDS's virtual AP defaults.
+            bool shouldNormalize = (!hasUsableAccessPoint && index == 0);
+            if (hasUsableAccessPoint)
+            {
+                shouldNormalize = !AccessPointNeedsRepair(accessPoint);
+            }
+
+            if (!shouldNormalize)
+            {
+                continue;
+            }
+
+            melonDS::Firmware::WifiAccessPoint originalAccessPoint = accessPoint;
+
+            if (AccessPointNeedsRepair(accessPoint))
+            {
+                u8 existingWFCID[sizeof(accessPoint.NintendoWFCID)];
+                memcpy(existingWFCID, accessPoint.NintendoWFCID, sizeof(existingWFCID));
+
+                accessPoint = melonDS::Firmware::WifiAccessPoint(consoleType);
+                memcpy(accessPoint.NintendoWFCID, existingWFCID, sizeof(existingWFCID));
+            }
+
+            accessPoint.Status = melonDS::Firmware::AccessPointStatus::Normal;
+            if (accessPoint.ConnectionConfigured == 0)
+            {
+                accessPoint.ConnectionConfigured = 0x01;
+            }
+
+            if (dnsOverride.has_value())
+            {
+                accessPoint.PrimaryDns = *dnsOverride;
+                accessPoint.SecondaryDns = {0, 0, 0, 0};
+            }
+
+            if (memcmp(originalAccessPoint.Bytes, accessPoint.Bytes, sizeof(accessPoint.Bytes)) != 0)
+            {
+                modified = true;
+            }
+        }
+
+        if (!modified)
+        {
+            return false;
+        }
+
+        firmware.UpdateChecksums();
+
+        if (url != nil)
+        {
+            NSData *updatedFirmware = [NSData dataWithBytes:firmware.Buffer() length:firmware.Length()];
+            NSError *error = nil;
+            if (![updatedFirmware writeToURL:url options:NSDataWritingAtomic error:&error])
+            {
+                NSLog(@"Failed to persist customized firmware Wi-Fi settings. %@", error);
+            }
+        }
+
+        return true;
+    }
+
     std::optional<melonDS::DSi_NAND::NANDImage> LoadDSiNANDImage(NSURL *url, const melonDS::DSiBIOSImage &arm7iBIOS)
     {
         std::string path = std::string(url.fileSystemRepresentation);
@@ -427,6 +562,7 @@ namespace
             }
 
             ApplyPersistentMACToFirmware(*dsFirmware, bridge.firmwareURL, MelonDSPersistentDSMACDefaultsKey);
+            ApplyWFCConfigurationToFirmware(*dsFirmware, bridge.firmwareURL, bridge.wfcDNS);
 
             ndsArgs.ARM9BIOS = std::move(arm9BIOS);
             ndsArgs.ARM7BIOS = std::move(arm7BIOS);
@@ -436,6 +572,7 @@ namespace
         {
             // Fall back to generated firmware + FreeBIOS if external assets are unavailable.
             ndsArgs.Firmware = melonDS::Firmware(0);
+            ApplyWFCConfigurationToFirmware(ndsArgs.Firmware, nil, bridge.wfcDNS);
         }
 
         if (bridge.systemType == MelonDSSystemTypeDSi)
@@ -449,6 +586,7 @@ namespace
             }
 
             ApplyPersistentMACToFirmware(*dsiFirmware, bridge.dsiFirmwareURL, MelonDSPersistentDSiMACDefaultsKey);
+            ApplyWFCConfigurationToFirmware(*dsiFirmware, bridge.dsiFirmwareURL, bridge.wfcDNS);
 
             auto nandImage = LoadDSiNANDImage(bridge.dsiNANDURL, *arm7iBIOS);
             if (!nandImage.has_value())
