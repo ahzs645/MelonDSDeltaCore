@@ -39,6 +39,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <unordered_set>
 #include <algorithm>
 #include <cstdarg>
 #include <unistd.h>
@@ -145,6 +146,7 @@ namespace
     {
         MelonDSMultiplayerPacketType type;
         uint16_t aid;
+        uint32_t senderID;
         uint64_t timestamp;
         std::vector<u8> payload;
     };
@@ -153,6 +155,7 @@ namespace
     std::deque<MultiplayerPacket> sRegularPackets;
     std::deque<MultiplayerPacket> sHostPackets;
     std::deque<MultiplayerPacket> sReplyPackets;
+    uint16_t sExpectedRemotePeerCount = 0;
 
     std::deque<MultiplayerPacket> &QueueForType(MelonDSMultiplayerPacketType type)
     {
@@ -196,16 +199,12 @@ namespace
         }
 
         u16 receivedMask = 0;
+        std::unordered_set<uint32_t> respondingPeers;
 
         while (!sReplyPackets.empty())
         {
             MultiplayerPacket packet = std::move(sReplyPackets.front());
             sReplyPackets.pop_front();
-
-            if (packet.payload.empty())
-            {
-                continue;
-            }
 
             // Mirror LocalMP behavior by dropping stale replies.
             if (packet.timestamp < timestamp && (timestamp - packet.timestamp) > 32)
@@ -213,18 +212,26 @@ namespace
                 continue;
             }
 
-            u16 aid = packet.aid;
-            if (aid == 0 || aid >= 16)
+            if (packet.senderID > 0)
             {
-                continue;
+                respondingPeers.insert(packet.senderID);
             }
 
-            size_t offset = (size_t)(aid - 1) * 1024;
-            size_t copyLength = std::min(packet.payload.size(), (size_t)1024);
-            memcpy(data + offset, packet.payload.data(), copyLength);
-            receivedMask |= (1 << aid);
+            u16 aid = packet.aid;
+            if (!packet.payload.empty() && aid > 0 && aid < 16)
+            {
+                size_t offset = (size_t)(aid - 1) * 1024;
+                size_t copyLength = std::min(packet.payload.size(), (size_t)1024);
+                memcpy(data + offset, packet.payload.data(), copyLength);
+                receivedMask |= (1 << aid);
+            }
 
             if ((receivedMask & aidmask) == aidmask)
+            {
+                break;
+            }
+
+            if (sExpectedRemotePeerCount > 0 && respondingPeers.size() >= sExpectedRemotePeerCount)
             {
                 break;
             }
@@ -412,7 +419,12 @@ namespace
 
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid
 {
-    if (packet.length == 0)
+    [self enqueueMultiplayerPacket:packet type:type timestamp:timestamp aid:aid senderID:0];
+}
+
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid senderID:(uint32_t)senderID
+{
+    if (packet.length == 0 && type != MelonDSMultiplayerPacketTypeReply)
     {
         return;
     }
@@ -420,12 +432,22 @@ namespace
     MultiplayerPacket incomingPacket;
     incomingPacket.type = type;
     incomingPacket.aid = aid;
+    incomingPacket.senderID = senderID;
     incomingPacket.timestamp = timestamp;
     incomingPacket.payload.resize(packet.length);
-    memcpy(incomingPacket.payload.data(), packet.bytes, packet.length);
+    if (packet.length > 0)
+    {
+        memcpy(incomingPacket.payload.data(), packet.bytes, packet.length);
+    }
 
     std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
     QueueForType(type).push_back(std::move(incomingPacket));
+}
+
++ (void)setExpectedRemotePeerCount:(uint16_t)count
+{
+    std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+    sExpectedRemotePeerCount = count;
 }
 
 - (instancetype)init
@@ -571,6 +593,54 @@ namespace
     });
 }
 
+- (void)loadRTCStateIntoConsole:(melonDS::NDS *)nds
+{
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfURL:self.rtcURL options:0 error:&error];
+    if (data == nil)
+    {
+        if (error != nil && !([error.domain isEqualToString:NSCocoaErrorDomain] && error.code == NSFileReadNoSuchFileError))
+        {
+            NSLog(@"Failed to load RTC state. %@", error);
+        }
+        return;
+    }
+
+    if (data.length != sizeof(melonDS::RTC::StateData))
+    {
+        NSLog(@"Invalid RTC state size: %zu (expected %zu).", (size_t)data.length, sizeof(melonDS::RTC::StateData));
+        return;
+    }
+
+    melonDS::RTC::StateData state;
+    memcpy(&state, data.bytes, sizeof(state));
+    nds->RTC.SetState(state);
+}
+
+- (void)saveRTCStateFromConsole:(melonDS::NDS *)nds
+{
+    melonDS::RTC::StateData state;
+    nds->RTC.GetState(state);
+
+    NSData *data = [NSData dataWithBytes:&state length:sizeof(state)];
+    NSError *error = nil;
+    if (![data writeToURL:self.rtcURL options:NSDataWritingAtomic error:&error])
+    {
+        NSLog(@"Failed to save RTC state. %@", error);
+    }
+}
+
+- (void)syncRTCDateTimeForConsole:(melonDS::NDS *)nds
+{
+    Config::Table globalConfig = Config::GetGlobalTable();
+    NSTimeInterval rtcOffset = (NSTimeInterval)globalConfig.GetInt64("RTC.Offset");
+    NSDate *targetDate = [NSDate dateWithTimeIntervalSinceNow:rtcOffset];
+
+    NSCalendar *calendar = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+    NSDateComponents *components = [calendar components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour | NSCalendarUnitMinute | NSCalendarUnitSecond) fromDate:targetDate];
+    nds->RTC.SetDateTime((int)components.year, (int)components.month, (int)components.day, (int)components.hour, (int)components.minute, (int)components.second);
+}
+
 #pragma mark - Emulation State -
 
 - (void)startWithGameURL:(NSURL *)gameURL
@@ -608,6 +678,7 @@ namespace
     {
         BOOL wasStopping = self.stopping;
         self.stopping = YES;
+        [self saveRTCStateFromConsole:existingConsole];
         if (existingConsole->IsRunning())
         {
             existingConsole->Stop();
@@ -706,6 +777,9 @@ namespace
         nds->LoadBIOS();
     }
 
+    [self loadRTCStateIntoConsole:nds];
+    [self syncRTCDateTimeForConsole:nds];
+
     self.stopping = NO;
 
     nds->Start();
@@ -717,6 +791,7 @@ namespace
 
     if (melonDS::NDS *nds = CurrentNDS())
     {
+        [self saveRTCStateFromConsole:nds];
         nds->Stop();
     }
 
@@ -1205,6 +1280,11 @@ namespace
     return [MelonDSEmulatorBridge.coreDirectoryURL URLByAppendingPathComponent:@"dsinand.bin"];
 }
 
+- (NSURL *)rtcURL
+{
+    return [MelonDSEmulatorBridge.coreDirectoryURL URLByAppendingPathComponent:@"rtc.bin"];
+}
+
 - (AVAudioConverter *)audioConverter
 {
     if (_audioConverter == nil)
@@ -1587,6 +1667,7 @@ namespace melonDS::Platform
         sRegularPackets.clear();
         sHostPackets.clear();
         sReplyPackets.clear();
+        sExpectedRemotePeerCount = 0;
     }
 
     void MP_End(void* userdata)
@@ -1596,12 +1677,15 @@ namespace melonDS::Platform
         sRegularPackets.clear();
         sHostPackets.clear();
         sReplyPackets.clear();
+        sExpectedRemotePeerCount = 0;
     }
 
     static int PublishMultiplayerPacket(u8* data, int len, u64 timestamp, MelonDSMultiplayerPacketType type, u16 aid)
     {
-        if (len <= 0) return 0;
-        NSData *packet = [NSData dataWithBytes:data length:len];
+        if (len < 0) return 0;
+        if (len == 0 && type != MelonDSMultiplayerPacketTypeReply) return 0;
+
+        NSData *packet = (len > 0) ? [NSData dataWithBytes:data length:len] : [NSData data];
         NSDictionary *userInfo = @{@"packet": packet, @"type": @(type), @"timestamp": @(timestamp), @"aid": @(aid)};
         [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSEmulatorBridge.didProduceMultiplayerPacketNotification object:MelonDSEmulatorBridge.sharedBridge userInfo:userInfo];
         return len;

@@ -65,6 +65,10 @@ typedef NS_ENUM(NSInteger, MelonDSMultiplayerPacketType)
 /// Enqueues an inbound multiplayer packet for consumption by melonDS MP_Recv* callbacks.
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp;
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid;
++ (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp aid:(uint16_t)aid senderID:(uint32_t)senderID;
+
+/// Updates the number of remote peers currently expected to answer multiplayer reply polls.
++ (void)setExpectedRemotePeerCount:(uint16_t)count;
 
 @end
 
