@@ -61,6 +61,10 @@ typedef NS_ENUM(NSInteger, MelonDSMultiplayerPacketType)
 /// - @"timestamp": NSNumber (uint64)
 /// - @"aid": NSNumber (uint16, only meaningful for MelonDSMultiplayerPacketTypeReply)
 @property (class, nonatomic, readonly) NSNotificationName didProduceMultiplayerPacketNotification;
+/// Posted whenever melonDS starts a new local wireless session.
+@property (class, nonatomic, readonly) NSNotificationName didBeginMultiplayerSessionNotification;
+/// Posted whenever melonDS ends the current local wireless session.
+@property (class, nonatomic, readonly) NSNotificationName didEndMultiplayerSessionNotification;
 
 /// Enqueues an inbound multiplayer packet for consumption by melonDS MP_Recv* callbacks.
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp;

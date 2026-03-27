@@ -141,6 +141,8 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 namespace
 {
     NSNotificationName const MelonDSDidProduceMultiplayerPacketNotification = @"MelonDSDidProduceMultiplayerPacketNotification";
+    NSNotificationName const MelonDSDidBeginMultiplayerSessionNotification = @"MelonDSDidBeginMultiplayerSessionNotification";
+    NSNotificationName const MelonDSDidEndMultiplayerSessionNotification = @"MelonDSDidEndMultiplayerSessionNotification";
     NSString * const MelonDSPersistentDSMACDefaultsKey = @"melondsPersistentDSMACAddress";
     NSString * const MelonDSPersistentDSiMACDefaultsKey = @"melondsPersistentDSiMACAddress";
 
@@ -657,6 +659,16 @@ namespace
 + (NSNotificationName)didProduceMultiplayerPacketNotification
 {
     return MelonDSDidProduceMultiplayerPacketNotification;
+}
+
++ (NSNotificationName)didBeginMultiplayerSessionNotification
+{
+    return MelonDSDidBeginMultiplayerSessionNotification;
+}
+
++ (NSNotificationName)didEndMultiplayerSessionNotification
+{
+    return MelonDSDidEndMultiplayerSessionNotification;
 }
 
 + (void)enqueueMultiplayerPacket:(NSData *)packet type:(MelonDSMultiplayerPacketType)type timestamp:(uint64_t)timestamp
@@ -1910,21 +1922,27 @@ namespace melonDS::Platform
     void MP_Begin(void* userdata)
     {
         (void)userdata;
-        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
-        sRegularPackets.clear();
-        sHostPackets.clear();
-        sReplyPackets.clear();
-        sExpectedRemotePeerCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+            sRegularPackets.clear();
+            sHostPackets.clear();
+            sReplyPackets.clear();
+            sExpectedRemotePeerCount = 0;
+        }
+        [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSEmulatorBridge.didBeginMultiplayerSessionNotification object:MelonDSEmulatorBridge.sharedBridge];
     }
 
     void MP_End(void* userdata)
     {
         (void)userdata;
-        std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
-        sRegularPackets.clear();
-        sHostPackets.clear();
-        sReplyPackets.clear();
-        sExpectedRemotePeerCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(sMultiplayerQueueLock);
+            sRegularPackets.clear();
+            sHostPackets.clear();
+            sReplyPackets.clear();
+            sExpectedRemotePeerCount = 0;
+        }
+        [[NSNotificationCenter defaultCenter] postNotificationName:MelonDSEmulatorBridge.didEndMultiplayerSessionNotification object:MelonDSEmulatorBridge.sharedBridge];
     }
 
     static int PublishMultiplayerPacket(u8* data, int len, u64 timestamp, MelonDSMultiplayerPacketType type, u16 aid)
