@@ -111,6 +111,11 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 
 @property (nonatomic, copy, nullable) NSData *saveData;
 @property (nonatomic, copy, nullable) NSData *gbaSaveData;
+@property (nonatomic, readonly) dispatch_queue_t firmwareWriteQueue;
+@property (nonatomic) uint32_t pendingDSFirmwareVersion;
+@property (nonatomic) uint32_t pendingDSiFirmwareVersion;
+@property (nonatomic, nullable) NSMutableData *pendingDSFirmwareData;
+@property (nonatomic, nullable) NSMutableData *pendingDSiFirmwareData;
 
 @property (nonatomic) uint32_t activatedInputs;
 @property (nonatomic) CGPoint touchScreenPoint;
@@ -369,6 +374,7 @@ namespace
             renderer->SetThreaded(true, nds.GPU);
         }
     }
+
 }
 
 @implementation MelonDSEmulatorBridge
@@ -376,6 +382,7 @@ namespace
 @synthesize videoRenderer = _videoRenderer;
 @synthesize saveUpdateHandler = _saveUpdateHandler;
 @synthesize audioConverter = _audioConverter;
+@synthesize firmwareWriteQueue = _firmwareWriteQueue;
 
 + (instancetype)sharedBridge
 {
@@ -433,6 +440,7 @@ namespace
 
         _microphoneBuffer = [[DLTARingBuffer alloc] initWithPreferredBufferSize:100 * 1024];
         _microphoneQueue = dispatch_queue_create("com.rileytestut.MelonDSDeltaCore.Microphone", DISPATCH_QUEUE_SERIAL);
+        _firmwareWriteQueue = dispatch_queue_create("com.rileytestut.MelonDSDeltaCore.Firmware", DISPATCH_QUEUE_SERIAL);
 
         _closedLidFrameCount = 0;
 
@@ -440,6 +448,127 @@ namespace
     }
 
     return self;
+}
+
+- (void)queueFirmwareWriteWithBytes:(const u8 *)bytes length:(u32)length offset:(u32)writeOffset writeLength:(u32)writeLength systemType:(MelonDSSystemType)systemType
+{
+    NSData *bufferSnapshot = [NSData dataWithBytes:bytes length:length];
+    dispatch_async(self.firmwareWriteQueue, ^{
+        BOOL isDSi = (systemType == MelonDSSystemTypeDSi);
+        NSURL *fileURL = isDSi ? self.dsiFirmwareURL : self.firmwareURL;
+        NSMutableData *pendingData = isDSi ? self.pendingDSiFirmwareData : self.pendingDSFirmwareData;
+
+        if (pendingData == nil || pendingData.length != length)
+        {
+            NSData *existingData = [NSData dataWithContentsOfURL:fileURL];
+            if (existingData.length == length)
+            {
+                pendingData = [existingData mutableCopy];
+            }
+            else
+            {
+                pendingData = [NSMutableData dataWithLength:length];
+            }
+        }
+
+        if (isDSi)
+        {
+            self.pendingDSiFirmwareData = pendingData;
+        }
+        else
+        {
+            self.pendingDSFirmwareData = pendingData;
+        }
+
+        NSMutableData *targetData = pendingData;
+        if (targetData.length != length)
+        {
+            return;
+        }
+
+        const u8 *snapshotBytes = (const u8 *)bufferSnapshot.bytes;
+        u8 *targetBytes = (u8 *)targetData.mutableBytes;
+
+        if ((writeOffset + writeLength) > length)
+        {
+            u32 wrappedLength = length - writeOffset;
+            memcpy(targetBytes + writeOffset, snapshotBytes + writeOffset, wrappedLength);
+
+            u32 remainingLength = writeLength - wrappedLength;
+            remainingLength = MIN(remainingLength, length);
+            memcpy(targetBytes, snapshotBytes, remainingLength);
+        }
+        else
+        {
+            memcpy(targetBytes + writeOffset, snapshotBytes + writeOffset, writeLength);
+        }
+
+        uint32_t scheduledVersion;
+        if (isDSi)
+        {
+            self.pendingDSiFirmwareVersion += 1;
+            scheduledVersion = self.pendingDSiFirmwareVersion;
+        }
+        else
+        {
+            self.pendingDSFirmwareVersion += 1;
+            scheduledVersion = self.pendingDSFirmwareVersion;
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)), self.firmwareWriteQueue, ^{
+            NSMutableData *scheduledData = isDSi ? self.pendingDSiFirmwareData : self.pendingDSFirmwareData;
+            uint32_t currentVersion = isDSi ? self.pendingDSiFirmwareVersion : self.pendingDSFirmwareVersion;
+            if (scheduledData == nil || currentVersion != scheduledVersion)
+            {
+                return;
+            }
+
+            NSError *error = nil;
+            if (![scheduledData writeToURL:fileURL options:NSDataWritingAtomic error:&error])
+            {
+                NSLog(@"Failed to flush firmware update to %@. %@", fileURL.path, error);
+                return;
+            }
+
+            if (systemType == MelonDSSystemTypeDSi)
+            {
+                self.pendingDSiFirmwareData = nil;
+            }
+            else
+            {
+                self.pendingDSFirmwareData = nil;
+            }
+        });
+    });
+}
+
+- (void)flushPendingFirmwareWrites
+{
+    dispatch_sync(self.firmwareWriteQueue, ^{
+        NSArray<NSDictionary<NSString *, id> *> *pendingWrites = @[
+            @{@"url": self.firmwareURL, @"data": self.pendingDSFirmwareData ?: [NSNull null]},
+            @{@"url": self.dsiFirmwareURL, @"data": self.pendingDSiFirmwareData ?: [NSNull null]},
+        ];
+
+        for (NSDictionary<NSString *, id> *pendingWrite in pendingWrites)
+        {
+            NSData *data = pendingWrite[@"data"];
+            if ((id)data == [NSNull null])
+            {
+                continue;
+            }
+
+            NSURL *fileURL = pendingWrite[@"url"];
+            NSError *error = nil;
+            if (![data writeToURL:fileURL options:NSDataWritingAtomic error:&error])
+            {
+                NSLog(@"Failed to flush pending firmware write to %@. %@", fileURL.path, error);
+            }
+        }
+
+        self.pendingDSFirmwareData = nil;
+        self.pendingDSiFirmwareData = nil;
+    });
 }
 
 #pragma mark - Emulation State -
@@ -592,6 +721,7 @@ namespace
     }
 
     [self.audioEngine stop];
+    [self flushPendingFirmwareWrites];
 
     // Assign to nil to prevent microphone indicator
     // staying on after returning from background.
@@ -1402,15 +1532,52 @@ namespace melonDS::Platform
 
     void WriteFirmware(const Firmware& firmware, u32 writeoffset, u32 writelen, void* userdata)
     {
-        (void)firmware;
-        (void)writeoffset;
-        (void)writelen;
         (void)userdata;
+
+        if (firmware.Buffer() == nullptr || firmware.Length() == 0)
+        {
+            return;
+        }
+
+        if (firmware.GetHeader().Identifier == GENERATED_FIRMWARE_IDENTIFIER)
+        {
+            // Delta currently only boots generated firmware when external BIOS assets are unavailable,
+            // so persisting partial writes here would not be reloaded on next launch.
+            return;
+        }
+
+        MelonDSEmulatorBridge *bridge = MelonDSEmulatorBridge.sharedBridge;
+        [bridge queueFirmwareWriteWithBytes:firmware.Buffer()
+                                    length:firmware.Length()
+                                    offset:writeoffset
+                               writeLength:writelen
+                                systemType:bridge.systemType];
     }
 
     void WriteDateTime(int year, int month, int day, int hour, int minute, int second, void* userdata)
     {
-        (void)year; (void)month; (void)day; (void)hour; (void)minute; (void)second; (void)userdata;
+        (void)userdata;
+
+        NSDateComponents *components = [[NSDateComponents alloc] init];
+        components.year = year;
+        components.month = month;
+        components.day = day;
+        components.hour = hour;
+        components.minute = minute;
+        components.second = second;
+
+        NSCalendar *calendar = [NSCalendar currentCalendar];
+        NSDate *targetDate = [calendar dateFromComponents:components];
+        if (targetDate == nil)
+        {
+            return;
+        }
+
+        NSTimeInterval rtcOffset = targetDate.timeIntervalSinceNow;
+        int64_t roundedOffset = (rtcOffset >= 0.0) ? (int64_t)(rtcOffset + 0.5) : (int64_t)(rtcOffset - 0.5);
+        Config::Table globalConfig = Config::GetGlobalTable();
+        globalConfig.SetInt64("RTC.Offset", roundedOffset);
+        Config::Save();
     }
 
     void MP_Begin(void* userdata)
