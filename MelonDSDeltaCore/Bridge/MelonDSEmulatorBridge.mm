@@ -141,6 +141,8 @@ void ParseTextCode(char* text, int tlen, u32* code, int clen) // or whatever thi
 namespace
 {
     NSNotificationName const MelonDSDidProduceMultiplayerPacketNotification = @"MelonDSDidProduceMultiplayerPacketNotification";
+    NSString * const MelonDSPersistentDSMACDefaultsKey = @"melondsPersistentDSMACAddress";
+    NSString * const MelonDSPersistentDSiMACDefaultsKey = @"melondsPersistentDSiMACAddress";
 
     struct MultiplayerPacket
     {
@@ -284,6 +286,109 @@ namespace
         return firmware;
     }
 
+    bool ParseMACAddressString(NSString *string, melonDS::MacAddress &macAddress)
+    {
+        int nibbleCount = 0;
+        u8 currentNibble = 0;
+
+        for (NSUInteger i = 0; i < string.length; i++)
+        {
+            unichar character = [string characterAtIndex:i];
+            int value = -1;
+
+            if (character >= '0' && character <= '9')
+            {
+                value = character - '0';
+            }
+            else if (character >= 'a' && character <= 'f')
+            {
+                value = character - 'a' + 10;
+            }
+            else if (character >= 'A' && character <= 'F')
+            {
+                value = character - 'A' + 10;
+            }
+            else
+            {
+                continue;
+            }
+
+            if ((nibbleCount & 1) == 0)
+            {
+                currentNibble = (u8)value;
+            }
+            else
+            {
+                macAddress[nibbleCount >> 1] = (u8)((currentNibble << 4) | value);
+            }
+
+            nibbleCount += 1;
+            if (nibbleCount >= 12)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    NSString *MACAddressString(const melonDS::MacAddress &macAddress)
+    {
+        return [NSString stringWithFormat:@"%02X:%02X:%02X:%02X:%02X:%02X", macAddress[0], macAddress[1], macAddress[2], macAddress[3], macAddress[4], macAddress[5]];
+    }
+
+    melonDS::MacAddress PersistentMACAddress(NSString *defaultsKey, const melonDS::MacAddress &fallback)
+    {
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        NSString *storedAddress = [defaults stringForKey:defaultsKey];
+
+        melonDS::MacAddress macAddress = fallback;
+        if (storedAddress.length > 0 && ParseMACAddressString(storedAddress, macAddress))
+        {
+            return macAddress;
+        }
+
+        uuid_t uuidBytes;
+        [[NSUUID UUID] getUUIDBytes:uuidBytes];
+
+        macAddress[0] = (u8)((uuidBytes[0] & 0xFC) | 0x02); // locally administered, unicast
+        macAddress[1] = uuidBytes[1];
+        macAddress[2] = uuidBytes[2];
+        macAddress[3] = uuidBytes[3];
+        macAddress[4] = uuidBytes[4];
+        macAddress[5] = uuidBytes[5];
+
+        [defaults setObject:MACAddressString(macAddress) forKey:defaultsKey];
+
+        return macAddress;
+    }
+
+    void ApplyPersistentMACToFirmware(melonDS::Firmware &firmware, NSURL *url, NSString *defaultsKey)
+    {
+        if (firmware.Buffer() == nullptr)
+        {
+            return;
+        }
+
+        auto &header = firmware.GetHeader();
+        melonDS::MacAddress desiredAddress = PersistentMACAddress(defaultsKey, header.MacAddr);
+        if (header.MacAddr == desiredAddress)
+        {
+            return;
+        }
+
+        header.MacAddr = desiredAddress;
+        header.UpdateChecksum();
+        firmware.UpdateChecksums();
+
+        NSData *updatedFirmware = [NSData dataWithBytes:firmware.Buffer() length:firmware.Length()];
+        NSError *error = nil;
+        if (![updatedFirmware writeToURL:url options:NSDataWritingAtomic error:&error])
+        {
+            NSLog(@"Failed to persist customized firmware MAC. %@", error);
+        }
+    }
+
     std::optional<melonDS::DSi_NAND::NANDImage> LoadDSiNANDImage(NSURL *url, const melonDS::DSiBIOSImage &arm7iBIOS)
     {
         std::string path = std::string(url.fileSystemRepresentation);
@@ -321,6 +426,8 @@ namespace
                 return nullptr;
             }
 
+            ApplyPersistentMACToFirmware(*dsFirmware, bridge.firmwareURL, MelonDSPersistentDSMACDefaultsKey);
+
             ndsArgs.ARM9BIOS = std::move(arm9BIOS);
             ndsArgs.ARM7BIOS = std::move(arm7BIOS);
             ndsArgs.Firmware = std::move(*dsFirmware);
@@ -340,6 +447,8 @@ namespace
             {
                 return nullptr;
             }
+
+            ApplyPersistentMACToFirmware(*dsiFirmware, bridge.dsiFirmwareURL, MelonDSPersistentDSiMACDefaultsKey);
 
             auto nandImage = LoadDSiNANDImage(bridge.dsiNANDURL, *arm7iBIOS);
             if (!nandImage.has_value())
